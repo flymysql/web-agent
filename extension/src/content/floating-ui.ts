@@ -132,8 +132,9 @@ const STYLES = `
 .msg.user { flex-direction: row-reverse; }
 .bubble {
   padding: 9px 12px; border-radius: 12px; font-size: 13px; line-height: 1.5;
-  max-width: 78%; word-break: break-word; white-space: pre-wrap;
+  max-width: 78%; word-break: break-word;
 }
+.bubble.text { white-space: pre-wrap; }
 .msg.agent .bubble { background: #fff; color: #1a1a2e; border: 1px solid #eceef5; border-bottom-left-radius: 4px; }
 .msg.user .bubble { background: #4f46e5; color: #fff; border-bottom-right-radius: 4px; }
 .msg.system { justify-content: center; }
@@ -408,7 +409,7 @@ export class AgentWidget {
   private addUserMessage(text: string): void {
     const el = document.createElement('div');
     el.className = 'msg user';
-    el.innerHTML = `<div class="bubble"></div>`;
+    el.innerHTML = `<div class="bubble text"></div>`;
     (el.querySelector('.bubble') as HTMLElement).textContent = text;
     this.messages.appendChild(el);
     this.scrollToBottom();
@@ -417,7 +418,7 @@ export class AgentWidget {
   private addAgentMessage(text: string): HTMLElement {
     const el = document.createElement('div');
     el.className = 'msg agent';
-    el.innerHTML = `<div class="bubble"></div>`;
+    el.innerHTML = `<div class="bubble text"></div>`;
     (el.querySelector('.bubble') as HTMLElement).textContent = text;
     this.messages.appendChild(el);
     this.scrollToBottom();
@@ -427,7 +428,7 @@ export class AgentWidget {
   private addSystemMessage(text: string): void {
     const el = document.createElement('div');
     el.className = 'msg system';
-    el.innerHTML = `<div class="bubble"></div>`;
+    el.innerHTML = `<div class="bubble text"></div>`;
     (el.querySelector('.bubble') as HTMLElement).textContent = text;
     this.messages.appendChild(el);
     this.scrollToBottom();
@@ -499,7 +500,7 @@ export class AgentWidget {
       this.planRenderedFor = task.id;
     }
 
-    for (const log of task.logs) {
+    for (const log of task.logs ?? []) {
       if (this.renderedLogIds.has(log.id)) continue;
       this.renderedLogIds.add(log.id);
       if (log.level === 'info' && log.message.startsWith('Executing step')) {

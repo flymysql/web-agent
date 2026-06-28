@@ -195,7 +195,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       case 'CREATE_TASK': {
         const tab = await getActiveTab();
         const pageContext = tab?.id ? await getPageContext(tab.id) : undefined;
-        const task = await apiRequest('/api/tasks', {
+        return apiRequest('/api/tasks', {
           method: 'POST',
           body: JSON.stringify({
             userRequest: message.userRequest,
@@ -207,7 +207,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             loopMaxIterations: message.loopMaxIterations,
           }),
         });
-        return { task };
       }
 
       case 'START_TASK':
