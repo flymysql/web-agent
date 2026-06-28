@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Browser Agent</title>
+  <link rel="stylesheet" href="./popup.css" />
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>AI Browser Agent</h1>
+      <div id="status" class="status disconnected">未连接</div>
+    </header>
+
+    <section class="input-section">
+      <textarea id="userRequest" placeholder="描述你想完成的任务，例如：提取本页所有链接并总结" rows="3"></textarea>
+      <div class="options">
+        <label>
+          <input type="checkbox" id="loopTask" />
+          循环任务
+        </label>
+        <input type="number" id="loopInterval" placeholder="间隔(ms)" value="60000" min="5000" disabled />
+      </div>
+      <button id="createBtn" class="btn primary">创建任务</button>
+    </section>
+
+    <section id="taskSection" class="task-section hidden">
+      <div class="task-header">
+        <span id="taskStatus" class="badge">pending</span>
+        <span id="taskId" class="task-id"></span>
+      </div>
+      <div id="planView" class="plan-view"></div>
+      <div id="confirmationBanner" class="confirmation hidden">
+        <p id="confirmationText"></p>
+        <div class="btn-group">
+          <button id="confirmBtn" class="btn success">确认执行</button>
+          <button id="rejectBtn" class="btn danger">拒绝</button>
+        </div>
+      </div>
+      <div class="btn-group">
+        <button id="startBtn" class="btn primary">开始</button>
+        <button id="pauseBtn" class="btn">暂停</button>
+        <button id="resumeBtn" class="btn">继续</button>
+        <button id="cancelBtn" class="btn danger">取消</button>
+      </div>
+      <div id="resultView" class="result-view"></div>
+      <div id="logView" class="log-view"></div>
+    </section>
+  </div>
+  <script type="module" src="./popup.ts"></script>
+</body>
+</html>

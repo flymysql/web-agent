@@ -1,0 +1,14 @@
+⚠️ 不要在这里加载扩展！
+
+这个目录是 monorepo 根目录，没有 manifest.json。
+
+请加载以下目录之一：
+
+  chrome-extension/     ← 推荐（运行 npm run build 后自动生成）
+  extension/dist/       ← 同上，原始构建输出
+
+步骤：
+1. npm install
+2. npm run build
+3. chrome://extensions → 开发者模式 → 加载已解压的扩展程序
+4. 选择 chrome-extension 文件夹

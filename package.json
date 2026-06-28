@@ -1,0 +1,21 @@
+{
+  "name": "ai-browser-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI Browser Agent - Chrome MV3 extension with cloud backend",
+  "workspaces": [
+    "shared",
+    "extension",
+    "server"
+  ],
+  "scripts": {
+    "build": "npm run build -w shared && npm run build -w extension && npm run build -w server && npm run copy:extension",
+    "copy:extension": "rm -rf chrome-extension && cp -R extension/dist chrome-extension",
+    "dev:server": "npm run dev -w server",
+    "dev:extension": "npm run dev -w extension",
+    "typecheck": "npm run typecheck -w shared && npm run typecheck -w extension && npm run typecheck -w server"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

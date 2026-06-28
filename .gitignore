@@ -1,0 +1,11 @@
+node_modules/
+dist/
+chrome-extension/
+.env
+*.log
+.DS_Store
+
+# stray compiled outputs inside source dirs
+shared/src/*.js
+shared/src/*.d.ts
+shared/src/*.map
