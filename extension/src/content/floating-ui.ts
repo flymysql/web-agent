@@ -151,6 +151,9 @@ const STYLES = `
   width: 26px; height: 26px; border-radius: 6px; cursor: pointer; font-size: 15px;
 }
 .panel-header button:hover { background: rgba(255,255,255,0.3); }
+.panel-header .stop-btn { background: #ef4444; color: #fff; font-size: 12px; padding: 2px 8px; width: auto; border-radius: 6px; font-weight: 600; }
+.panel-header .stop-btn:hover { background: #dc2626; }
+.panel-header .stop-btn:disabled { opacity: 0.6; cursor: default; }
 
 .messages { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
 
@@ -260,6 +263,7 @@ export class AgentWidget {
   private wfDrawer!: HTMLDivElement;
   private sessionList!: HTMLDivElement;
   private wfList!: HTMLDivElement;
+  private stopBtn!: HTMLButtonElement;
 
   private currentSessionId: string | null = null;
   private sessions: ChatSession[] = [];
@@ -307,6 +311,7 @@ export class AgentWidget {
         <button class="new-btn" title="新建会话">➕</button>
         <button class="session-btn" title="会话历史">🕘</button>
         <button class="wf-btn" title="工作流仓库">🗂</button>
+        <button class="stop-btn" title="停止当前任务" style="display:none">⏹ 停止</button>
         <button class="min-btn" title="收起">—</button>
       </div>
       <div class="messages"></div>
@@ -341,6 +346,7 @@ export class AgentWidget {
     this.wfDrawer = panel.querySelector('.wf-drawer') as HTMLDivElement;
     this.sessionList = panel.querySelector('.session-list') as HTMLDivElement;
     this.wfList = panel.querySelector('.wf-list') as HTMLDivElement;
+    this.stopBtn = panel.querySelector('.stop-btn') as HTMLButtonElement;
 
     this.restorePosition();
     this.addAgentMessage('你好！我是你的页面助手 🤖\n描述你想完成的任务，我会先制定计划再执行。');
@@ -439,6 +445,7 @@ export class AgentWidget {
     );
 
     this.sendBtn.addEventListener('click', () => this.handleSend());
+    this.stopBtn.addEventListener('click', () => this.stopCurrentTask());
     this.input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
@@ -609,6 +616,30 @@ export class AgentWidget {
 
   private setState(state: AgentState): void {
     this.ball.dataset.state = state;
+    // Show the global stop button whenever a task is actively running.
+    const active = state === 'working' || state === 'thinking' || state === 'waiting';
+    if (this.stopBtn) this.stopBtn.style.display = active ? '' : 'none';
+  }
+
+  private async stopCurrentTask(): Promise<void> {
+    const taskId = this.currentTask?.id;
+    if (!taskId) {
+      this.stopBtn.style.display = 'none';
+      return;
+    }
+    this.stopBtn.disabled = true;
+    try {
+      await sendMessage({ type: 'CANCEL_TASK', taskId });
+      this.addSystemMessage('⏹ 已停止任务');
+    } catch (err) {
+      this.addSystemMessage(`停止失败：${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      this.stopBtn.disabled = false;
+      this.stopBtn.style.display = 'none';
+      this.stopPolling();
+      this.setState('idle');
+      await this.refresh();
+    }
   }
 
   private scrollToBottom(): void {
