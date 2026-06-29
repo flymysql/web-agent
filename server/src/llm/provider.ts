@@ -12,7 +12,7 @@ const TOOLS_BRIEF = ALL_TOOLS.map((t) => {
   return `- ${t.name}(${params}): ${t.description}`;
 }).join('\n');
 
-const HISTORY_WINDOW = 12;
+const HISTORY_WINDOW = 8;
 
 export interface AgentHistoryItem {
   tool: string;
@@ -365,10 +365,10 @@ Do NOT repeat an action that already failed or produced no progress; try a DIFFE
 For a multi-item goal (e.g. "summarize every article in a series"), DELEGATE one item at a time: delegate({"goal":"open <link> and summarize it"}). The sub-agent completes that sub-goal and returns a concise result; then continue with the next item.
 Open a different page with navigate (do not guess URLs into clicks). After any action that triggers loading, use wait (selector/text/urlIncludes) before reading the result. Before declaring done, use expect to verify the goal actually holds.
 Respond ONLY with valid JSON, one of:
-{ "thought": "why this action", "done": false, "action": { "tool": "toolName", "args": { } } }
+{ "thought": "one short sentence (≤25 words)", "done": false, "action": { "tool": "toolName", "args": { } } }
 { "thought": "why finished", "done": true, "summary": "what was accomplished" }
 You have FULL power to modify the page yourself — do NOT tell the user to open the console or do it manually. For theming / colors / dark mode, STRONGLY prefer a single injectCSS call with grouped CSS rules that target many elements at once (one rule can cover buttons, links, inputs, etc.) instead of many per-element setStyle calls — it is far more efficient and uses fewer steps. Keep each injectCSS payload focused and not excessively long; if a theme needs a lot of CSS, split it across a few injectCSS calls rather than one giant string (huge JSON values can get truncated). Use setStyle/setText/setHTML/setAttribute/removeElement only for targeted one-off DOM changes; use getHTML to inspect structure; and use evaluate to run arbitrary JavaScript as a last resort. Prefer the most specific tool and actually perform the task. To access the internet use webSearch (find pages/info), imageSearch (returns DIRECT image URLs for pictures), or httpRequest (call any HTTP API) — these run through the browser and have network access. To put a picture on the page, FIRST call imageSearch to get a real working image URL, THEN injectCSS with background-image:url(...) — never invent image URLs. ALL network access MUST go through these browser tools — there is NO server-side fetch.
-Set done=true when the goal is achieved, or when it cannot proceed. Avoid repeating a failed action; try an alternative.`;
+Set done=true when the goal is achieved, or when it cannot proceed. Avoid repeating a failed action; try an alternative. Keep your "thought" to ONE concise sentence — do not write long explanations.`;
 
 export async function decideNextAction(
   goal: string,
@@ -393,12 +393,13 @@ export async function decideNextAction(
 
   const hint = planHint?.steps?.length
     ? `\n\nInitial plan (hint only, adapt as needed):\n${planHint.steps
+        .slice(0, 10)
         .map((s, i) => `${i + 1}. ${s.description} [${s.tool}]`)
         .join('\n')}`
     : '';
 
   const ctxBlock = conversationContext
-    ? `\n\n会话历史(此前任务与结果):\n${conversationContext}`
+    ? `\n\n会话历史(此前任务与结果):\n${conversationContext.slice(0, 800)}`
     : '';
 
   const messages: LLMMessage[] = [
@@ -406,8 +407,8 @@ export async function decideNextAction(
     {
       role: 'user',
       content: `GOAL: ${goal}${hint}${ctxBlock}\n\nCURRENT PAGE:\n${summarizePageContext(pageContext)}\n\nINTERACTIVE ELEMENTS (selector → text):\n${pageContext.interactiveElements
-        .slice(0, 40)
-        .map((el) => `${el.selector} → ${el.tag}${el.type ? `[${el.type}]` : ''} ${el.text ?? el.placeholder ?? el.name ?? ''}`)
+        .slice(0, 25)
+        .map((el) => `${el.selector} → ${el.tag}${el.type ? `[${el.type}]` : ''} ${(el.text ?? el.placeholder ?? el.name ?? '').slice(0, 60)}`)
         .join('\n')}\n\nHISTORY:\n${historyText}${correction ? `\n\n⚠️ 重要提醒：${correction}` : ''}`,
     },
   ];

@@ -48,19 +48,19 @@ export function summarizePageContext(ctx: PageContext): string {
     `Form fields: ${ctx.formFields.length}`,
     '',
     'Visible text (truncated):',
-    ctx.visibleText.slice(0, 2000),
+    ctx.visibleText.slice(0, 1200),
   ];
 
   if (ctx.links.length > 0) {
     lines.push('', 'Top links:');
-    ctx.links.slice(0, 10).forEach((l) => {
+    ctx.links.slice(0, 8).forEach((l) => {
       lines.push(`- ${l.text || '(no text)'} → ${l.href}`);
     });
   }
 
   if (ctx.formFields.length > 0) {
     lines.push('', 'Form fields:');
-    ctx.formFields.slice(0, 10).forEach((f) => {
+    ctx.formFields.slice(0, 8).forEach((f) => {
       lines.push(`- ${f.tag}${f.type ? `[${f.type}]` : ''} ${f.name ?? f.placeholder ?? f.text ?? f.selector}`);
     });
   }

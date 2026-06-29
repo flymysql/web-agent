@@ -80,7 +80,7 @@ export function getSessionTasks(id: string): Task[] {
 export function buildConversationContext(
   sessionId: string | undefined,
   excludeTaskId?: string,
-  maxTasks = 5
+  maxTasks = 3
 ): string {
   if (!sessionId) return '';
   const session = sessions.get(sessionId);
@@ -99,7 +99,7 @@ export function buildConversationContext(
     if (t.status === 'completed') outcome = t.result ?? '(已完成)';
     else if (t.status === 'failed') outcome = `失败: ${t.error ?? '未知'}`;
     else outcome = t.status;
-    return `${i + 1}. 用户请求: ${t.userRequest}\n   结果(${t.status}): ${String(outcome).slice(0, 300)}`;
+    return `${i + 1}. 用户请求: ${t.userRequest}\n   结果(${t.status}): ${String(outcome).slice(0, 160)}`;
   });
 
   return lines.join('\n');
