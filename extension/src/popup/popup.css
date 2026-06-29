@@ -106,11 +106,75 @@ header h1 {
   border-color: #dc2626;
 }
 
+.btn.tiny {
+  padding: 3px 8px;
+  font-size: 11px;
+}
+
 .btn-group {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
   margin: 10px 0;
+}
+
+.workflow-section {
+  margin-top: 16px;
+}
+
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: #6b7280;
+  margin-bottom: 8px;
+}
+
+.workflow-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.workflow-list .empty {
+  color: #9ca3af;
+  font-size: 12px;
+  padding: 6px 0;
+}
+
+.wf-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: #fff;
+  border: 1px solid #eceef5;
+  border-radius: 8px;
+}
+
+.wf-name {
+  font-weight: 500;
+  font-size: 13px;
+}
+
+.wf-meta {
+  font-size: 11px;
+  color: #9ca3af;
+  margin-top: 2px;
+}
+
+.wf-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+#saveWfBtn {
+  margin: 8px 0;
+  width: 100%;
 }
 
 .hidden {

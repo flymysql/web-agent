@@ -25,6 +25,14 @@
       <button id="createBtn" class="btn primary">创建任务</button>
     </section>
 
+    <section class="workflow-section">
+      <div class="section-head">
+        <span>我的工作流</span>
+        <button id="refreshWfBtn" class="btn tiny" title="刷新">↻</button>
+      </div>
+      <div id="workflowList" class="workflow-list"></div>
+    </section>
+
     <section id="taskSection" class="task-section hidden">
       <div class="task-header">
         <span id="taskStatus" class="badge">pending</span>
@@ -45,6 +53,7 @@
         <button id="cancelBtn" class="btn danger">取消</button>
       </div>
       <div id="resultView" class="result-view"></div>
+      <button id="saveWfBtn" class="btn success hidden">保存为工作流</button>
       <div id="logView" class="log-view"></div>
     </section>
   </div>

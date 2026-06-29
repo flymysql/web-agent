@@ -5,8 +5,9 @@ import type {
   TaskCheckpoint,
   PageContext,
 } from '@ai-browser-agent/shared';
+import { JsonRepository } from '../persistence/json-repository.js';
 
-const tasks = new Map<string, Task>();
+const tasks = new JsonRepository<Task>('tasks');
 
 function createLog(level: TaskLogEntry['level'], message: string, data?: Record<string, unknown>): TaskLogEntry {
   return {
@@ -23,8 +24,11 @@ export function createTask(input: {
   tabId?: number;
   url?: string;
   kind?: 'once' | 'loop';
+  mode?: 'agent' | 'replay';
+  maxSteps?: number;
   loopIntervalMs?: number;
   loopMaxIterations?: number;
+  workflowId?: string;
 }): Task {
   const now = Date.now();
   const task: Task = {
@@ -32,6 +36,9 @@ export function createTask(input: {
     userRequest: input.userRequest,
     status: 'pending',
     kind: input.kind ?? 'once',
+    mode: input.mode ?? 'agent',
+    maxSteps: input.maxSteps,
+    workflowId: input.workflowId,
     tabId: input.tabId,
     url: input.url,
     currentStepIndex: 0,
@@ -43,7 +50,7 @@ export function createTask(input: {
     createdAt: now,
     updatedAt: now,
   };
-  tasks.set(task.id, task);
+  tasks.upsert(task);
   return task;
 }
 
@@ -52,14 +59,14 @@ export function getTask(id: string): Task | undefined {
 }
 
 export function listTasks(): Task[] {
-  return Array.from(tasks.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+  return tasks.list().sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
 export function updateTask(id: string, updates: Partial<Task>): Task {
   const task = tasks.get(id);
   if (!task) throw new Error(`Task not found: ${id}`);
   const updated = { ...task, ...updates, updatedAt: Date.now() };
-  tasks.set(id, updated);
+  tasks.upsert(updated);
   return updated;
 }
 

@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite build --watch",
-    "build": "vite build",
+    "dev": "node build.mjs --watch",
+    "build": "node build.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

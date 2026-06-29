@@ -7,6 +7,7 @@ const BACKEND_WS = DEFAULT_WS_URL;
 let ws: WebSocket | null = null;
 let sessionId: string | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let lastError: string | null = null;
 const pendingToolCalls = new Map<string, {
   resolve: (value: unknown) => void;
   reject: (err: Error) => void;
@@ -49,9 +50,20 @@ function connectBackend(): void {
     return;
   }
 
-  ws = new WebSocket(BACKEND_WS);
+  console.log('[AI Browser Agent] Connecting to backend:', BACKEND_WS);
+  try {
+    ws = new WebSocket(BACKEND_WS);
+  } catch (err) {
+    lastError = err instanceof Error ? err.message : String(err);
+    console.error('[AI Browser Agent] WebSocket construction failed:', lastError);
+    broadcastStatus({ connected: false });
+    reconnectTimer = setTimeout(connectBackend, 3000);
+    return;
+  }
 
   ws.onopen = async () => {
+    console.log('[AI Browser Agent] WebSocket connected');
+    lastError = null;
     const tab = await getActiveTab();
     sendWs({
       id: crypto.randomUUID(),
@@ -147,18 +159,28 @@ function connectBackend(): void {
     }
   };
 
-  ws.onclose = () => {
+  ws.onclose = (event) => {
+    console.warn(
+      `[AI Browser Agent] WebSocket closed (code=${event.code}, reason="${event.reason}")`
+    );
+    if (event.code !== 1000 && !lastError) {
+      lastError = `WebSocket closed unexpectedly (code ${event.code})`;
+    }
+    sessionId = null;
     broadcastStatus({ connected: false });
+    if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(connectBackend, 3000);
   };
 
   ws.onerror = () => {
+    lastError = `Failed to reach ${BACKEND_WS} — is the server running? (npm run dev:server)`;
+    console.error('[AI Browser Agent] WebSocket error:', lastError);
     ws?.close();
   };
 }
 
 function broadcastStatus(status: { connected: boolean; sessionId?: string | null }): void {
-  chrome.runtime.sendMessage({ type: 'BACKEND_STATUS', ...status }).catch(() => {});
+  chrome.runtime.sendMessage({ type: 'BACKEND_STATUS', lastError, ...status }).catch(() => {});
 }
 
 async function apiRequest(path: string, options: RequestInit = {}): Promise<unknown> {
@@ -181,10 +203,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     switch (message.type) {
       case 'CONNECT_BACKEND':
         connectBackend();
-        return { connected: ws?.readyState === WebSocket.OPEN, sessionId };
+        return { connected: ws?.readyState === WebSocket.OPEN, sessionId, lastError };
 
       case 'GET_BACKEND_STATUS':
-        return { connected: ws?.readyState === WebSocket.OPEN, sessionId };
+        return { connected: ws?.readyState === WebSocket.OPEN, sessionId, lastError };
 
       case 'GET_PAGE_CONTEXT': {
         const tab = await getActiveTab();
@@ -232,6 +254,34 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
       case 'LIST_TASKS':
         return apiRequest('/api/tasks');
+
+      case 'LIST_WORKFLOWS':
+        return apiRequest('/api/workflows');
+
+      case 'RUN_WORKFLOW': {
+        const tab = await getActiveTab();
+        return apiRequest(`/api/workflows/${message.workflowId}/run`, {
+          method: 'POST',
+          body: JSON.stringify({
+            params: message.params ?? {},
+            tabId: tab?.id,
+            url: tab?.url,
+          }),
+        });
+      }
+
+      case 'DELETE_WORKFLOW':
+        return apiRequest(`/api/workflows/${message.workflowId}`, { method: 'DELETE' });
+
+      case 'SAVE_AS_WORKFLOW':
+        return apiRequest(`/api/tasks/${message.taskId}/save-as-workflow`, {
+          method: 'POST',
+          body: JSON.stringify({
+            name: message.name,
+            description: message.description,
+            triggers: message.triggers,
+          }),
+        });
 
       default:
         return { error: `Unknown message: ${message.type}` };

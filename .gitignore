@@ -5,6 +5,10 @@ chrome-extension/
 *.log
 .DS_Store
 
+# local persistence (JSON store)
+.data/
+**/.data/
+
 # stray compiled outputs inside source dirs
 shared/src/*.js
 shared/src/*.d.ts

@@ -82,11 +82,56 @@ export interface TaskLogEntry {
   data?: Record<string, unknown>;
 }
 
+export type TriggerType = 'manual' | 'scheduled' | 'onPageOpen';
+
+export interface WorkflowTrigger {
+  type: TriggerType;
+  /** scheduled: execution interval in ms */
+  intervalMs?: number;
+  /** onPageOpen: URL substring or glob-like pattern to match */
+  urlPattern?: string;
+}
+
+export interface WorkflowParam {
+  key: string;
+  label: string;
+  default?: string;
+}
+
+export interface WorkflowStep {
+  id: string;
+  description: string;
+  tool: string;
+  args: Record<string, unknown>;
+  riskLevel: RiskLevel;
+  requiresConfirmation: boolean;
+}
+
+export interface Workflow {
+  id: string;
+  name: string;
+  description?: string;
+  startUrl?: string;
+  params: WorkflowParam[];
+  steps: WorkflowStep[];
+  triggers: WorkflowTrigger[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** 'agent' = ReAct loop (observe→decide→act); 'replay' = deterministic static steps */
+export type TaskMode = 'agent' | 'replay';
+
 export interface Task {
   id: string;
   userRequest: string;
   status: TaskStatus;
   kind: TaskKind;
+  mode: TaskMode;
+  maxSteps?: number;
+  workflowId?: string;
+  /** Generalized steps recorded from a successful agent run, ready to save as a workflow */
+  recordedSteps?: WorkflowStep[];
   tabId?: number;
   url?: string;
   plan?: TaskPlan;
