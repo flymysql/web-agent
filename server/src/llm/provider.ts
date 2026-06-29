@@ -206,8 +206,14 @@ export function describeLLM(): string {
   return `${model} @ ${baseUrl}`;
 }
 
-async function chatCompletion(messages: LLMMessage[], label = 'llm'): Promise<string> {
+async function chatCompletion(
+  messages: LLMMessage[],
+  label = 'llm',
+  opts: { jsonMode?: boolean; maxTokens?: number } = {}
+): Promise<string> {
   const { baseUrl, apiKey, model, extraHeaders, extraBody, maxTokens, timeoutMs } = llmConfig();
+  const jsonMode = opts.jsonMode !== false;
+  const effMaxTokens = opts.maxTokens ?? maxTokens;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -234,8 +240,8 @@ async function chatCompletion(messages: LLMMessage[], label = 'llm'): Promise<st
         model,
         messages,
         temperature: 0.2,
-        max_tokens: maxTokens,
-        response_format: { type: 'json_object' },
+        max_tokens: effMaxTokens,
+        ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
         ...extraBody,
       }),
       signal: controller.signal,
@@ -362,7 +368,7 @@ Selectors should come from the current page's interactive elements (use their se
 The CURRENT PAGE section below is ALWAYS refreshed for you before every decision — you can already see the page's text, links and interactive elements. Therefore NEVER call extractPage/observe just to "read" or "get" the page; that wastes a step. Act directly (click a specific link, navigate, type, etc.) or finish with done.
 The plan is only a rough hint — adapt freely to what the page actually shows. If reality differs from the plan, change course to reach the GOAL instead of following the plan literally.
 Do NOT repeat an action that already failed or produced no progress; try a DIFFERENT selector, link, or tool. If you already have the information the goal needs, set done=true and put the answer in "summary".
-For a multi-item goal (e.g. "summarize every article in a series"), DELEGATE one item at a time: delegate({"goal":"open <link> and summarize it"}). The sub-agent completes that sub-goal and returns a concise result; then continue with the next item.
+For a multi-item goal (e.g. "summarize every article in a series"): first gather the list of item URLs from the current page, then DELEGATE one item at a time, ALWAYS passing the url: delegate({"url":"/post/123/","title":"...","goal":"summarize this article"}). Each result is stored automatically and shown to you under "进度". NEVER re-delegate an item already listed there, and do NOT open/read items yourself — let sub-agents do it. When every item is collected, simply set done=true; the system AUTO-SYNTHESIZES all collected items into the final answer, so you do NOT need to write the combined summary yourself.
 Open a different page with navigate (do not guess URLs into clicks). After any action that triggers loading, use wait (selector/text/urlIncludes) before reading the result. Before declaring done, use expect to verify the goal actually holds.
 Respond ONLY with valid JSON, one of:
 { "thought": "one short sentence (≤25 words)", "done": false, "action": { "tool": "toolName", "args": { } } }
@@ -376,7 +382,8 @@ export async function decideNextAction(
   history: AgentHistoryItem[],
   planHint?: TaskPlan,
   conversationContext?: string,
-  correction?: string
+  correction?: string,
+  progress?: string
 ): Promise<AgentDecision> {
   const shown = history.slice(-HISTORY_WINDOW);
   const omitted = history.length - shown.length;
@@ -406,7 +413,7 @@ export async function decideNextAction(
     { role: 'system', content: AGENT_SYSTEM_PROMPT },
     {
       role: 'user',
-      content: `GOAL: ${goal}${hint}${ctxBlock}\n\nCURRENT PAGE:\n${summarizePageContext(pageContext)}\n\nINTERACTIVE ELEMENTS (selector → text):\n${pageContext.interactiveElements
+      content: `GOAL: ${goal}${hint}${ctxBlock}${progress ? `\n\n进度（以下条目已采集完成，切勿重复处理）：\n${progress}` : ''}\n\nCURRENT PAGE:\n${summarizePageContext(pageContext)}\n\nINTERACTIVE ELEMENTS (selector → text):\n${pageContext.interactiveElements
         .slice(0, 25)
         .map((el) => `${el.selector} → ${el.tag}${el.type ? `[${el.type}]` : ''} ${(el.text ?? el.placeholder ?? el.name ?? '').slice(0, 60)}`)
         .join('\n')}\n\nHISTORY:\n${historyText}${correction ? `\n\n⚠️ 重要提醒：${correction}` : ''}`,
@@ -422,4 +429,29 @@ export async function decideNextAction(
     summary: parsed.summary,
     action: parsed.action,
   };
+}
+
+/**
+ * Reduce step: synthesize many collected items into one cohesive deliverable.
+ * Uses plain-text mode (not JSON) so the model can write a rich summary.
+ */
+export async function generateSummaryWithLLM(
+  goal: string,
+  items: { title?: string; content: string }[]
+): Promise<string> {
+  const body = items
+    .map((it, i) => `【${i + 1}. ${it.title ?? '(无标题)'}】\n${it.content}`)
+    .join('\n\n');
+  const messages: LLMMessage[] = [
+    {
+      role: 'system',
+      content:
+        '你是一个严谨的内容分析助手。基于用户提供的多条素材，产出结构清晰、忠于原文、用中文书写的整体分析与逐条要点总结。不要编造素材以外的信息。',
+    },
+    {
+      role: 'user',
+      content: `任务目标：${goal}\n\n已采集素材（共 ${items.length} 条）：\n${body}\n\n请输出：1) 整体分析；2) 逐条要点（标题 + 一两句概括）。`,
+    },
+  ];
+  return chatCompletion(messages, 'synthesis', { jsonMode: false });
 }

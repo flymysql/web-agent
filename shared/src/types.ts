@@ -122,6 +122,16 @@ export interface Workflow {
 /** 'agent' = ReAct loop (observe→decide→act); 'replay' = deterministic static steps */
 export type TaskMode = 'agent' | 'replay';
 
+/** One durable item collected by the agent (e.g. a summarized article). */
+export interface CollectedItem {
+  /** Stable dedup key, typically the item URL. */
+  key: string;
+  title?: string;
+  /** Full content/summary — stored untruncated; only truncated in UI. */
+  content: string;
+  at: number;
+}
+
 export interface Task {
   id: string;
   sessionId?: string;
@@ -140,6 +150,8 @@ export interface Task {
   checkpoint?: TaskCheckpoint;
   toolCalls: ToolCallRecord[];
   logs: TaskLogEntry[];
+  /** Durable results gathered during a map-reduce style run (deduped by key). */
+  collected?: CollectedItem[];
   result?: string;
   error?: string;
   loopIntervalMs?: number;

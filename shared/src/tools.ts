@@ -380,9 +380,11 @@ export const BACKEND_TOOLS: ToolDefinition[] = [
   {
     name: 'delegate',
     description:
-      'Spawn a sub-agent to autonomously complete ONE focused sub-goal on the current tab (e.g. "open this article link and summarize it"), then return a concise result. Use for repetitive multi-item work so the main agent stays high-level.',
+      'Spawn an isolated sub-agent to complete ONE focused sub-goal (e.g. "open this article and summarize it") and return a concise result that is stored automatically. ALWAYS pass url (the target page) so the sub-agent navigates directly. The system dedupes by url and auto-synthesizes all collected results at the end — do NOT re-delegate an item already collected.',
     parameters: [
-      { name: 'goal', type: 'string', description: 'The focused sub-goal for the sub-agent', required: true },
+      { name: 'goal', type: 'string', description: 'The focused sub-goal, e.g. "summarize this article"', required: true },
+      { name: 'url', type: 'string', description: 'Target page URL to open first (strongly recommended)', required: false },
+      { name: 'title', type: 'string', description: 'Human-readable title of the item', required: false },
       { name: 'maxSteps', type: 'number', description: 'Max steps for the sub-agent (default 12)', required: false },
     ],
     riskLevel: 'low',

@@ -5,6 +5,7 @@ import type {
   PageContext,
   PlanStep,
   WorkflowStep,
+  CollectedItem,
 } from '@ai-browser-agent/shared';
 import { isBrowserTool, isBackendTool } from '@ai-browser-agent/shared';
 import {
@@ -30,6 +31,7 @@ import { getRuntimeConfig } from '../config/runtime-config.js';
 import { debugLog } from '../debug/logger.js';
 import {
   decideNextAction,
+  generateSummaryWithLLM,
   type AgentHistoryItem,
 } from '../llm/provider.js';
 
@@ -373,6 +375,7 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
   let correction: string | undefined;
   let redundantReads = 0;
   let replanned = false;
+  let offlineHits = 0;
 
   if (activeAgentLoops.has(taskId)) return task;
   activeAgentLoops.add(taskId);
@@ -410,7 +413,7 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
 
     let decision;
     try {
-      decision = await decideNextAction(task.userRequest, pageContext, buildHistory(task), task.plan, conversationContext, correction);
+      decision = await decideNextAction(task.userRequest, pageContext, buildHistory(task), task.plan, conversationContext, correction, progressBlock(task));
       correction = undefined;
     } catch (err) {
       task = updateTask(taskId, {
@@ -429,9 +432,10 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
       // Final verification: re-observe so the recorded result reflects the true end state.
       const finalCtx = await observePage(task);
       if (finalCtx) pageContext = finalCtx;
+      const finalResult = await finalizeResult(taskId, decision.summary);
       task = updateTask(taskId, {
         status: 'completed',
-        result: decision.summary ?? summarizeResult(task),
+        result: finalResult,
         recordedSteps: recordWorkflowDraft(task),
       });
       addLog(taskId, 'info', 'Agent 判定任务完成');
@@ -469,7 +473,7 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
         }
         task = updateTask(taskId, {
           status: 'completed',
-          result: summarizeResult(task) + '\n\n⚠️ 多次尝试读取页面但未能继续推进，已停止。',
+          result: (await finalizeResult(taskId)) + '\n\n⚠️ 多次尝试读取页面但未能继续推进，已停止。',
           recordedSteps: recordWorkflowDraft(task),
         });
         emit(taskId);
@@ -479,28 +483,58 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
     }
     redundantReads = 0;
 
-    // Sub-agent delegation: run a bounded nested agent loop for ONE focused
-    // sub-goal on the same tab, then feed its concise result back to the parent.
+    // Sub-agent delegation: run an ISOLATED bounded nested agent loop for ONE
+    // focused sub-goal, store the result in the durable ledger (deduped by key),
+    // and surface progress back to the parent.
     if (action.tool === 'delegate') {
-      const subGoal = String((action.args as Record<string, unknown>)?.goal ?? '').trim();
-      if (!subGoal) {
-        correction = 'delegate 需要提供 goal 参数（要委派的子目标）。';
+      const dargs = action.args as Record<string, unknown>;
+      const subGoal = String(dargs?.goal ?? '').trim();
+      const subUrl = String(dargs?.url ?? '').trim();
+      const subTitle = String(dargs?.title ?? '').trim() || undefined;
+      const key = subUrl || subTitle || subGoal;
+      if (!subGoal && !subUrl) {
+        correction = 'delegate 需要提供 goal（子目标），并建议提供 url（目标页面）。';
         continue;
       }
-      const subMax = Number((action.args as Record<string, unknown>)?.maxSteps) || 12;
-      addLog(taskId, 'info', `🧩 委派子任务：${subGoal}`);
+      if (key && (task.collected ?? []).some((c) => c.key === key)) {
+        correction = `『${subTitle ?? key}』已采集，请处理尚未采集的下一项；若全部完成请用 done 结束（系统会自动汇总）。`;
+        addLog(taskId, 'info', `↩️ 跳过重复委派：${subTitle ?? key}`);
+        emit(taskId);
+        continue;
+      }
+      const subMax = Number(dargs?.maxSteps) || 12;
+      addLog(taskId, 'info', `🧩 委派子任务：${subTitle ?? subGoal}${subUrl ? `（${subUrl}）` : ''}`);
       emit(taskId);
-      const subResult = await runSubAgent(taskId, subGoal, subMax, pageContext);
-      const refreshed = await observePage(task);
+      const sub = await runSubAgent(taskId, subGoal || `打开并总结 ${subUrl}`, subMax, subUrl, subTitle);
+
+      if (sub.offline) {
+        offlineHits++;
+        recordSyntheticCall(taskId, 'delegate', { goal: subGoal, url: subUrl }, sub.content, sub.content);
+        addLog(taskId, 'warn', `🌐 子任务因离线失败：${sub.content.slice(0, 100)}`);
+        if (offlineHits >= 2) {
+          task = updateTask(taskId, {
+            status: 'paused',
+            error: '检测到网络离线，已暂停。恢复网络后点击「继续」即可。',
+          });
+          addLog(taskId, 'warn', '🌐 多次检测到离线，已暂停任务');
+          emit(taskId);
+          break;
+        }
+      } else {
+        offlineHits = 0;
+        collectItem(taskId, key, sub.title ?? subTitle, sub.content);
+        recordSyntheticCall(taskId, 'delegate', { goal: subGoal, url: subUrl }, sub.content);
+        addLog(taskId, 'info', `🧩 已采集「${sub.title ?? subTitle ?? key}」：${sub.content.slice(0, 120)}`);
+      }
+
+      const refreshed = await observePage(getTask(taskId)!);
       if (refreshed) {
         pageContext = refreshed;
         lastUrl = refreshed.url;
       }
-      recordSyntheticCall(taskId, 'delegate', { goal: subGoal }, subResult);
-      addLog(taskId, 'info', `🧩 子任务完成：${subResult.slice(0, 140)}`);
       actionCounts.clear();
       consecutiveFailures = 0;
-      task = updateTask(taskId, { currentStepIndex: task.currentStepIndex + 1 });
+      task = updateTask(taskId, { currentStepIndex: getTask(taskId)!.currentStepIndex + 1 });
       emit(taskId);
       continue;
     }
@@ -525,7 +559,7 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
       // Graceful stop instead of a hard failure — keep what was accomplished.
       task = updateTask(taskId, {
         status: 'completed',
-        result: summarizeResult(task) + '\n\n⚠️ 多次尝试后仍无法继续推进，已停止。',
+        result: (await finalizeResult(taskId)) + '\n\n⚠️ 多次尝试后仍无法继续推进，已停止。',
         recordedSteps: recordWorkflowDraft(task),
       });
       addLog(taskId, 'warn', `检测到重复动作，已停止: ${sig.slice(0, 120)}`);
@@ -596,7 +630,7 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
       task = updateTask(taskId, {
         status: 'completed',
         result:
-          `${summarizeResult(task)}\n\n⚠️ 已达到单次步数上限（${maxSteps} 步）后停止，任务可能尚未完全完成。` +
+          `${await finalizeResult(taskId)}\n\n⚠️ 已达到单次步数上限（${maxSteps} 步）后停止，任务可能尚未完全完成。` +
           `如需继续，请回复“继续”，或在 .env 中调大 AGENT_MAX_STEPS。`,
         recordedSteps: recordWorkflowDraft(task),
       });
@@ -729,39 +763,64 @@ function recordSyntheticCall(
   updateTask(taskId, { toolCalls: [...t.toolCalls, record] });
 }
 
+interface SubAgentResult {
+  ok: boolean;
+  offline?: boolean;
+  title?: string;
+  content: string;
+}
+
 /**
- * Run a bounded nested agent loop for a single focused sub-goal on the same tab.
- * Shares the parent task's tool-call history (so context carries over) but keeps
- * its own repeat/failure counters. Returns a concise textual result.
+ * Run an ISOLATED bounded nested agent loop for a single sub-goal.
+ *
+ *  - Its own fresh history (does NOT see the parent's tool-calls), so it can't
+ *    hallucinate "already done" from unrelated items.
+ *  - Navigates directly to `url` first (index-based clicks are unreliable).
+ *  - Fast-fails on offline/error pages instead of burning steps on retries.
  */
 async function runSubAgent(
   taskId: string,
   goal: string,
   maxSteps: number,
-  startContext?: PageContext
-): Promise<string> {
+  url?: string,
+  title?: string
+): Promise<SubAgentResult> {
   const base = getTask(taskId);
-  if (!base) return '子任务无法启动（任务不存在）';
-  let pageContext = startContext;
+  if (!base) return { ok: false, content: '子任务无法启动（任务不存在）' };
+
+  const subHistory: AgentHistoryItem[] = [];
+  let pageContext: PageContext | undefined;
   let steps = 0;
   let consecutiveFailures = 0;
+  let lastText = '';
   const actionCounts = new Map<string, number>();
   let correction: string | undefined;
-  const conversationContext = buildConversationContext(base.sessionId, taskId);
+
+  if (url) {
+    const nav = await executeStep(getTask(taskId)!, makeSyntheticStep('navigate', { url }, `打开 ${url}`));
+    if (nav.pageContext) {
+      pageContext = nav.pageContext;
+      setPageContext(taskId, pageContext);
+    }
+    subHistory.push({ tool: 'navigate', args: { url }, success: nav.success, error: nav.error, result: nav.success ? 'navigated' : undefined });
+    addLog(taskId, 'info', `🧩↳ 打开 ${url}`);
+    emit(taskId);
+  }
+  if (!pageContext) pageContext = await observePage(getTask(taskId)!);
+  if (!pageContext) return { ok: false, title, content: '子任务无法获取页面内容' };
+  if (isOfflinePage(pageContext)) {
+    return { ok: false, offline: true, title, content: `无法访问 ${url ?? '页面'}：检测到离线/无网络。` };
+  }
 
   while (steps < maxSteps) {
     const cur = getTask(taskId);
     if (!cur || cur.status === 'cancelled' || cur.status === 'paused') break;
-    if (!pageContext) {
-      pageContext = await observePage(cur);
-      if (!pageContext) return '子任务无法获取页面内容';
-    }
 
     let decision;
     try {
-      decision = await decideNextAction(goal, pageContext, buildHistory(cur), undefined, conversationContext, correction);
+      decision = await decideNextAction(goal, pageContext, subHistory, undefined, undefined, correction);
     } catch (err) {
-      return `子任务决策失败：${err instanceof Error ? err.message : String(err)}`;
+      return { ok: false, title, content: `子任务决策失败：${err instanceof Error ? err.message : String(err)}` };
     }
     correction = undefined;
     if (decision.thought) {
@@ -769,13 +828,13 @@ async function runSubAgent(
       emit(taskId);
     }
     if (decision.done) {
-      return decision.summary || summarizeResult(getTask(taskId)!);
+      return { ok: true, title, content: decision.summary || lastText || '（子任务完成，但未给出摘要）' };
     }
 
     const action = decision.action;
     if (!action?.tool) {
       consecutiveFailures++;
-      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) return '子任务未产出有效动作';
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) return { ok: false, title, content: lastText || '子任务未产出有效动作' };
       continue;
     }
     if (action.tool === 'extractPage' || action.tool === 'observePage') {
@@ -790,7 +849,7 @@ async function runSubAgent(
     const sig = `${action.tool}:${JSON.stringify(action.args)}`;
     const seen = (actionCounts.get(sig) ?? 0) + 1;
     actionCounts.set(sig, seen);
-    if (seen >= 3) return decision.summary || summarizeResult(getTask(taskId)!);
+    if (seen >= 3) return { ok: true, title, content: decision.summary || lastText || '（子任务在重复后结束）' };
 
     const confirmation = requiresConfirmation(action.tool, action.args, decision.thought);
     if (confirmation.required) {
@@ -808,15 +867,78 @@ async function runSubAgent(
       pageContext = result.pageContext;
       setPageContext(taskId, pageContext);
     }
+    if (pageContext && isOfflinePage(pageContext)) {
+      return { ok: false, offline: true, title, content: `无法访问 ${url ?? '页面'}：检测到离线/无网络。` };
+    }
+    if (action.tool === 'readText' && result.success && result.result && typeof result.result === 'object') {
+      const txt = (result.result as { text?: string }).text;
+      if (txt) lastText = txt.slice(0, 2000);
+    }
+    subHistory.push({
+      tool: action.tool,
+      args: compactArgs(action.args),
+      success: result.success,
+      error: result.error,
+      result: result.success ? summarizeToolResult(action.tool, result.result) : undefined,
+    });
     if (!result.success) {
       consecutiveFailures++;
-      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) return `子任务多次失败：${result.error}`;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) return { ok: false, title, content: lastText || `子任务多次失败：${result.error}` };
     } else {
       consecutiveFailures = 0;
     }
     steps++;
   }
-  return summarizeResult(getTask(taskId)!);
+  return { ok: true, title, content: lastText || '（子任务步数用尽，未能产出完整摘要）' };
+}
+
+const OFFLINE_MARKERS = [
+  '没有网络', '无网络', '网络不可用', '网络连接已断开', '无法连接到网络', '无法访问此网站',
+  '此网站无法访问', '断开网络连接', 'offline', 'no internet', 'err_internet', 'err_connection',
+  'err_name_not_resolved',
+];
+
+function isOfflinePage(ctx: PageContext): boolean {
+  const text = `${ctx.title ?? ''} ${(ctx.visibleText ?? '').slice(0, 300)}`.toLowerCase();
+  return OFFLINE_MARKERS.some((m) => text.includes(m));
+}
+
+function collectItem(taskId: string, key: string, title: string | undefined, content: string): void {
+  const t = getTask(taskId);
+  if (!t) return;
+  const collected: CollectedItem[] = [...(t.collected ?? [])];
+  const item: CollectedItem = { key: key || `item-${collected.length + 1}`, title, content, at: Date.now() };
+  const idx = collected.findIndex((c) => c.key === item.key);
+  if (idx >= 0) collected[idx] = item;
+  else collected.push(item);
+  updateTask(taskId, { collected });
+}
+
+function progressBlock(task: Task): string {
+  const items = task.collected ?? [];
+  if (!items.length) return '';
+  return items.map((it, i) => `${i + 1}. ${it.title ?? it.key}`).join('\n');
+}
+
+async function finalizeResult(taskId: string, summary?: string): Promise<string> {
+  const t = getTask(taskId);
+  if (!t) return summary ?? '';
+  const items = t.collected ?? [];
+  if (items.length > 0) {
+    addLog(taskId, 'info', `🧮 正在汇总 ${items.length} 项采集结果…`);
+    emit(taskId);
+    try {
+      const synth = await generateSummaryWithLLM(
+        t.userRequest,
+        items.map((i) => ({ title: i.title, content: i.content }))
+      );
+      return `${synth}\n\n——（已汇总 ${items.length} 项）`;
+    } catch (err) {
+      addLog(taskId, 'warn', `汇总失败，改用拼接：${err instanceof Error ? err.message : String(err)}`);
+      return items.map((it, i) => `${i + 1}. ${it.title ?? it.key}\n${it.content}`).join('\n\n');
+    }
+  }
+  return summary ?? summarizeResult(t);
 }
 
 function summarizeResult(task: Task): string {
