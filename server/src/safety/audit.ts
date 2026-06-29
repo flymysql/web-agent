@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import type { AuditEntry, RiskLevel } from '@ai-browser-agent/shared';
-import { getToolDefinition, DANGEROUS_KEYWORDS } from '@ai-browser-agent/shared';
+import { getToolDefinition } from '@ai-browser-agent/shared';
 
 const auditLog: AuditEntry[] = [];
 
@@ -42,6 +42,29 @@ export function maskArgs(args: Record<string, unknown>): {
   return { masked, maskedFields };
 }
 
+/**
+ * Tools that are inherently safe (read-only observation or plain navigation).
+ * These NEVER require confirmation — opening pages, reading content, scrolling,
+ * waiting and searching are all low-risk by the user's own definition.
+ */
+const SAFE_TOOLS = new Set([
+  'extractPage', 'observePage', 'readText', 'getText', 'getHTML', 'getAttribute',
+  'scroll', 'wait', 'expect', 'screenshot', 'navigate', 'hover', 'inspect',
+  'consoleLogs', 'network', 'webSearch', 'imageSearch', 'storage', 'cookie',
+  'tab', 'pressKey', 'notify', 'delegate',
+]);
+
+/**
+ * Genuinely destructive intents that should still pause for confirmation.
+ * Deliberately tighter than DANGEROUS_KEYWORDS (which also flags benign words
+ * like "post"/"send"/"submit" that routinely appear in URLs and link text).
+ */
+const CONFIRM_KEYWORDS = [
+  'pay ', 'payment', 'checkout', 'place order', 'confirm order',
+  'transfer', 'withdraw', 'credit card',
+  '支付', '付款', '下单', '转账', '提现', '删除账户', '注销账户', '确认支付',
+];
+
 export function requiresConfirmation(
   tool: string,
   args: Record<string, unknown>,
@@ -52,15 +75,22 @@ export function requiresConfirmation(
     return { required: true, reason: `Tool ${tool} requires confirmation` };
   }
 
-  // Only scan intent-bearing fields, NOT payloads like code/css/html/body —
-  // otherwise CSS/JS containing words like "post"/"remove" cause false positives.
-  const SCAN_FIELDS = ['selector', 'url', 'text', 'value', 'title', 'message', 'name', 'attribute', 'query'];
+  // Low-risk navigation / read tools proceed without asking the user.
+  if (SAFE_TOOLS.has(tool)) {
+    return { required: false };
+  }
+
+  // For action tools (click/type/...), only scan intent-bearing text — NOT
+  // url/selector/code/css/html — so navigating to a "/post/" URL or clicking a
+  // "下一页" link never trips a false positive. Only truly destructive intent
+  // (payment / money transfer) still asks for confirmation.
+  const SCAN_FIELDS = ['text', 'value', 'title', 'message'];
   const argText = SCAN_FIELDS.map((k) => String((args as Record<string, unknown>)[k] ?? '')).join(' ');
   const textToCheck = [stepDescription ?? '', argText].join(' ').toLowerCase();
 
-  for (const kw of DANGEROUS_KEYWORDS) {
+  for (const kw of CONFIRM_KEYWORDS) {
     if (textToCheck.includes(kw)) {
-      return { required: true, reason: `Detected dangerous keyword: ${kw}` };
+      return { required: true, reason: `高风险操作（${kw}）需要确认` };
     }
   }
 

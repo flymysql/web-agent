@@ -167,6 +167,7 @@ const STYLES = `
 .msg.system .bubble { background: transparent; color: #9ca3af; font-size: 11px; padding: 2px 8px; max-width: 100%; }
 
 .bubble .plan-title { font-weight: 600; margin-bottom: 6px; }
+.bubble .plan-hint { color: #9ca3af; font-size: 11px; margin-top: 4px; }
 .bubble ol { margin: 0; padding-left: 18px; }
 .bubble li { margin-bottom: 3px; }
 .bubble li.risk-high { color: #dc2626; }
@@ -716,12 +717,16 @@ export class AgentWidget {
       const m = log.message;
       if (log.level === 'error') {
         this.addSystemMessage(`❌ ${m}`);
-      } else if (m.startsWith('🤔')) {
-        this.addSystemMessage(m); // agent thought
-      } else if (m.startsWith('📄')) {
-        this.addSystemMessage(m); // page navigation
+      } else if (m.startsWith('🤔') || m.startsWith('📄')) {
+        // Agent thoughts and page navigations — show live reasoning.
+        this.addSystemMessage(m);
       } else if (m.startsWith('执行:') || m.startsWith('Executing step')) {
-        this.addSystemMessage(`⚙️ ${m}`); // tool execution step
+        this.addSystemMessage(`⚙️ ${m}`);
+      } else if (m.startsWith('🧩') || m.startsWith('🔁') || m.startsWith('🛠️')) {
+        // Sub-agent / replan / adjustment notices.
+        this.addSystemMessage(m);
+      } else if (log.level === 'warn' && (m.includes('确认') || m.includes('重复') || m.includes('调整') || m.includes('重新规划'))) {
+        this.addSystemMessage(`⚠️ ${m}`);
       }
     }
 
@@ -1075,35 +1080,28 @@ export class AgentWidget {
       )
       .join('');
     const loopHint = task.kind === 'loop' ? `（循环，每 ${task.loopIntervalMs ?? 0}ms）` : '';
+    // The task already auto-executes on the server — no manual "开始执行" gate.
+    // Show the plan as a live todo list; the agent adapts it as it runs.
     el.innerHTML = `
       <div class="bubble">
-        <div class="plan-title">📋 我的计划${this.escape(loopHint)}（${steps.length} 步）</div>
+        <div class="plan-title">📋 执行计划${this.escape(loopHint)}（${steps.length} 步，自动执行中）</div>
         <ol>${list}</ol>
+        <div class="plan-hint">计划仅为参考，Agent 会根据页面实际情况动态调整。</div>
         <div class="inline-actions">
-          <button class="btn-go">开始执行</button>
-          <button class="btn-cancel">取消</button>
+          <button class="btn-cancel">停止任务</button>
         </div>
       </div>`;
     this.messages.appendChild(el);
     this.scrollToBottom();
+    this.setState('working');
+    this.startPolling();
 
-    const goBtn = el.querySelector('.btn-go') as HTMLButtonElement;
     const cancelBtn = el.querySelector('.btn-cancel') as HTMLButtonElement;
-    goBtn.addEventListener('click', async () => {
-      goBtn.disabled = true;
-      cancelBtn.disabled = true;
-      el.querySelector('.inline-actions')?.remove();
-      await sendMessage({ type: 'START_TASK', taskId: task.id });
-      this.setState('working');
-      this.startPolling();
-      await this.refresh();
-    });
     cancelBtn.addEventListener('click', async () => {
-      goBtn.disabled = true;
       cancelBtn.disabled = true;
       el.querySelector('.inline-actions')?.remove();
       await sendMessage({ type: 'CANCEL_TASK', taskId: task.id });
-      this.addSystemMessage('已取消任务');
+      this.addSystemMessage('已停止任务');
       await this.refresh();
     });
   }

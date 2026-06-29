@@ -359,6 +359,10 @@ Given the GOAL, the CURRENT PAGE, and the HISTORY of actions already taken, deci
 Available tools:
 ${TOOLS_BRIEF}
 Selectors should come from the current page's interactive elements (use their selector field).
+The CURRENT PAGE section below is ALWAYS refreshed for you before every decision — you can already see the page's text, links and interactive elements. Therefore NEVER call extractPage/observe just to "read" or "get" the page; that wastes a step. Act directly (click a specific link, navigate, type, etc.) or finish with done.
+The plan is only a rough hint — adapt freely to what the page actually shows. If reality differs from the plan, change course to reach the GOAL instead of following the plan literally.
+Do NOT repeat an action that already failed or produced no progress; try a DIFFERENT selector, link, or tool. If you already have the information the goal needs, set done=true and put the answer in "summary".
+For a multi-item goal (e.g. "summarize every article in a series"), DELEGATE one item at a time: delegate({"goal":"open <link> and summarize it"}). The sub-agent completes that sub-goal and returns a concise result; then continue with the next item.
 Open a different page with navigate (do not guess URLs into clicks). After any action that triggers loading, use wait (selector/text/urlIncludes) before reading the result. Before declaring done, use expect to verify the goal actually holds.
 Respond ONLY with valid JSON, one of:
 { "thought": "why this action", "done": false, "action": { "tool": "toolName", "args": { } } }
@@ -371,7 +375,8 @@ export async function decideNextAction(
   pageContext: PageContext,
   history: AgentHistoryItem[],
   planHint?: TaskPlan,
-  conversationContext?: string
+  conversationContext?: string,
+  correction?: string
 ): Promise<AgentDecision> {
   const shown = history.slice(-HISTORY_WINDOW);
   const omitted = history.length - shown.length;
@@ -403,7 +408,7 @@ export async function decideNextAction(
       content: `GOAL: ${goal}${hint}${ctxBlock}\n\nCURRENT PAGE:\n${summarizePageContext(pageContext)}\n\nINTERACTIVE ELEMENTS (selector → text):\n${pageContext.interactiveElements
         .slice(0, 40)
         .map((el) => `${el.selector} → ${el.tag}${el.type ? `[${el.type}]` : ''} ${el.text ?? el.placeholder ?? el.name ?? ''}`)
-        .join('\n')}\n\nHISTORY:\n${historyText}`,
+        .join('\n')}\n\nHISTORY:\n${historyText}${correction ? `\n\n⚠️ 重要提醒：${correction}` : ''}`,
     },
   ];
 

@@ -38,6 +38,9 @@ function getDefaultMaxSteps(): number {
 }
 const MAX_CONSECUTIVE_FAILURES = 3;
 
+/** Task ids with an agent loop currently running — prevents double execution. */
+const activeAgentLoops = new Set<string>();
+
 export type ToolExecutor = (
   taskId: string,
   tool: string,
@@ -367,7 +370,13 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
   let consecutiveFailures = 0;
   const actionCounts = new Map<string, number>();
   let lastUrl: string | undefined = pageContext?.url;
+  let correction: string | undefined;
+  let redundantReads = 0;
+  let replanned = false;
 
+  if (activeAgentLoops.has(taskId)) return task;
+  activeAgentLoops.add(taskId);
+  try {
   while (true) {
     task = getTask(taskId)!;
     if (task.status === 'paused' || task.status === 'cancelled') break;
@@ -401,7 +410,8 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
 
     let decision;
     try {
-      decision = await decideNextAction(task.userRequest, pageContext, buildHistory(task), task.plan, conversationContext);
+      decision = await decideNextAction(task.userRequest, pageContext, buildHistory(task), task.plan, conversationContext, correction);
+      correction = undefined;
     } catch (err) {
       task = updateTask(taskId, {
         status: 'failed',
@@ -440,13 +450,83 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
       continue;
     }
 
+    // The page is re-observed for the model every iteration, so calling
+    // extractPage as an action is redundant. Skip it and nudge the model to act
+    // on the content it already has instead of looping on reads.
+    if (action.tool === 'extractPage' || action.tool === 'observePage') {
+      redundantReads++;
+      correction =
+        '你不需要调用 extractPage 读取页面——每一步我都会把最新页面内容提供给你。请直接基于"当前页面/可交互元素"选择一个能推进目标的具体动作（点击某个链接、navigate、delegate 子任务，或在信息已足够时 done 并给出 summary）。';
+      addLog(taskId, 'info', '🛠️ 已跳过冗余的页面读取，提示模型直接行动');
+      emit(taskId);
+      if (redundantReads >= 3) {
+        if (!replanned) {
+          replanned = true;
+          await replanInPlace(taskId, pageContext, '反复尝试读取页面但未推进');
+          actionCounts.clear();
+          redundantReads = 0;
+          continue;
+        }
+        task = updateTask(taskId, {
+          status: 'completed',
+          result: summarizeResult(task) + '\n\n⚠️ 多次尝试读取页面但未能继续推进，已停止。',
+          recordedSteps: recordWorkflowDraft(task),
+        });
+        emit(taskId);
+        break;
+      }
+      continue;
+    }
+    redundantReads = 0;
+
+    // Sub-agent delegation: run a bounded nested agent loop for ONE focused
+    // sub-goal on the same tab, then feed its concise result back to the parent.
+    if (action.tool === 'delegate') {
+      const subGoal = String((action.args as Record<string, unknown>)?.goal ?? '').trim();
+      if (!subGoal) {
+        correction = 'delegate 需要提供 goal 参数（要委派的子目标）。';
+        continue;
+      }
+      const subMax = Number((action.args as Record<string, unknown>)?.maxSteps) || 12;
+      addLog(taskId, 'info', `🧩 委派子任务：${subGoal}`);
+      emit(taskId);
+      const subResult = await runSubAgent(taskId, subGoal, subMax, pageContext);
+      const refreshed = await observePage(task);
+      if (refreshed) {
+        pageContext = refreshed;
+        lastUrl = refreshed.url;
+      }
+      recordSyntheticCall(taskId, 'delegate', { goal: subGoal }, subResult);
+      addLog(taskId, 'info', `🧩 子任务完成：${subResult.slice(0, 140)}`);
+      actionCounts.clear();
+      consecutiveFailures = 0;
+      task = updateTask(taskId, { currentStepIndex: task.currentStepIndex + 1 });
+      emit(taskId);
+      continue;
+    }
+
     const sig = `${action.tool}:${JSON.stringify(action.args)}`;
     const seen = (actionCounts.get(sig) ?? 0) + 1;
     actionCounts.set(sig, seen);
+    if (seen === 2) {
+      // Second identical attempt — warn the model before it digs in further.
+      correction = `你刚才已经执行过相同动作 ${action.tool}，但没有带来进展。请改用不同的选择器/链接/工具来达成目标；若信息已足够就用 done 结束。`;
+    }
     if (seen >= 3) {
+      if (!replanned) {
+        replanned = true;
+        addLog(taskId, 'warn', '🔁 重复动作未见进展，根据当前页面重新规划');
+        await replanInPlace(taskId, pageContext, `重复动作 ${action.tool} 未推进`);
+        actionCounts.clear();
+        correction = '已根据当前页面生成新计划，请选择与之前不同的下一步，避免重复无效动作。';
+        emit(taskId);
+        continue;
+      }
+      // Graceful stop instead of a hard failure — keep what was accomplished.
       task = updateTask(taskId, {
-        status: 'failed',
-        error: `检测到重复动作(${action.tool})已 ${seen} 次仍无进展，已停止以避免卡死。`,
+        status: 'completed',
+        result: summarizeResult(task) + '\n\n⚠️ 多次尝试后仍无法继续推进，已停止。',
+        recordedSteps: recordWorkflowDraft(task),
       });
       addLog(taskId, 'warn', `检测到重复动作，已停止: ${sig.slice(0, 120)}`);
       emit(taskId);
@@ -526,6 +606,9 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
 
   emit(taskId);
   return task;
+  } finally {
+    activeAgentLoops.delete(taskId);
+  }
 }
 
 async function executeStep(
@@ -602,6 +685,138 @@ async function executeStep(
   });
 
   return { ...result, callId };
+}
+
+async function replanInPlace(
+  taskId: string,
+  pageContext: PageContext | undefined,
+  reason: string
+): Promise<void> {
+  try {
+    const t = getTask(taskId);
+    if (!t) return;
+    const conversationContext = buildConversationContext(t.sessionId, taskId);
+    const plan = await createPlan(t.userRequest, pageContext, conversationContext);
+    updateTask(taskId, { plan });
+    addLog(taskId, 'info', `🔁 已根据当前页面重新规划（${reason}），新计划 ${plan.steps.length} 步`);
+  } catch (err) {
+    addLog(taskId, 'warn', `重新规划失败：${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+function recordSyntheticCall(
+  taskId: string,
+  tool: string,
+  args: Record<string, unknown>,
+  result: unknown,
+  error?: string
+): void {
+  const t = getTask(taskId);
+  if (!t) return;
+  const record: ToolCallRecord = {
+    id: uuidv4(),
+    taskId,
+    stepId: uuidv4(),
+    tool,
+    args,
+    startedAt: Date.now(),
+    completedAt: Date.now(),
+    riskLevel: 'low',
+    confirmed: true,
+    result,
+    error,
+  };
+  updateTask(taskId, { toolCalls: [...t.toolCalls, record] });
+}
+
+/**
+ * Run a bounded nested agent loop for a single focused sub-goal on the same tab.
+ * Shares the parent task's tool-call history (so context carries over) but keeps
+ * its own repeat/failure counters. Returns a concise textual result.
+ */
+async function runSubAgent(
+  taskId: string,
+  goal: string,
+  maxSteps: number,
+  startContext?: PageContext
+): Promise<string> {
+  const base = getTask(taskId);
+  if (!base) return '子任务无法启动（任务不存在）';
+  let pageContext = startContext;
+  let steps = 0;
+  let consecutiveFailures = 0;
+  const actionCounts = new Map<string, number>();
+  let correction: string | undefined;
+  const conversationContext = buildConversationContext(base.sessionId, taskId);
+
+  while (steps < maxSteps) {
+    const cur = getTask(taskId);
+    if (!cur || cur.status === 'cancelled' || cur.status === 'paused') break;
+    if (!pageContext) {
+      pageContext = await observePage(cur);
+      if (!pageContext) return '子任务无法获取页面内容';
+    }
+
+    let decision;
+    try {
+      decision = await decideNextAction(goal, pageContext, buildHistory(cur), undefined, conversationContext, correction);
+    } catch (err) {
+      return `子任务决策失败：${err instanceof Error ? err.message : String(err)}`;
+    }
+    correction = undefined;
+    if (decision.thought) {
+      addLog(taskId, 'info', `🧩↳ ${decision.thought}`);
+      emit(taskId);
+    }
+    if (decision.done) {
+      return decision.summary || summarizeResult(getTask(taskId)!);
+    }
+
+    const action = decision.action;
+    if (!action?.tool) {
+      consecutiveFailures++;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) return '子任务未产出有效动作';
+      continue;
+    }
+    if (action.tool === 'extractPage' || action.tool === 'observePage') {
+      correction = '页面内容已提供，请直接行动或用 done 结束子任务。';
+      continue;
+    }
+    if (action.tool === 'delegate') {
+      correction = '子任务中不要再委派，请直接完成当前子目标。';
+      continue;
+    }
+
+    const sig = `${action.tool}:${JSON.stringify(action.args)}`;
+    const seen = (actionCounts.get(sig) ?? 0) + 1;
+    actionCounts.set(sig, seen);
+    if (seen >= 3) return decision.summary || summarizeResult(getTask(taskId)!);
+
+    const confirmation = requiresConfirmation(action.tool, action.args, decision.thought);
+    if (confirmation.required) {
+      correction = `子任务中跳过高风险操作（${action.tool}）。请改用低风险方式或结束子任务。`;
+      continue;
+    }
+
+    addLog(taskId, 'info', `🧩↳ 执行: ${action.tool}`);
+    emit(taskId);
+    const result = await executeStep(
+      getTask(taskId)!,
+      makeSyntheticStep(action.tool, action.args, decision.thought || action.tool)
+    );
+    if (result.pageContext) {
+      pageContext = result.pageContext;
+      setPageContext(taskId, pageContext);
+    }
+    if (!result.success) {
+      consecutiveFailures++;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) return `子任务多次失败：${result.error}`;
+    } else {
+      consecutiveFailures = 0;
+    }
+    steps++;
+  }
+  return summarizeResult(getTask(taskId)!);
 }
 
 function summarizeResult(task: Task): string {

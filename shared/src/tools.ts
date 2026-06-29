@@ -378,6 +378,17 @@ export const BROWSER_TOOLS: ToolDefinition[] = [
 
 export const BACKEND_TOOLS: ToolDefinition[] = [
   {
+    name: 'delegate',
+    description:
+      'Spawn a sub-agent to autonomously complete ONE focused sub-goal on the current tab (e.g. "open this article link and summarize it"), then return a concise result. Use for repetitive multi-item work so the main agent stays high-level.',
+    parameters: [
+      { name: 'goal', type: 'string', description: 'The focused sub-goal for the sub-agent', required: true },
+      { name: 'maxSteps', type: 'number', description: 'Max steps for the sub-agent (default 12)', required: false },
+    ],
+    riskLevel: 'low',
+    runtime: 'backend',
+  },
+  {
     name: 'notify',
     description: 'Send a notification to the user',
     parameters: [
