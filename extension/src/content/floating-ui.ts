@@ -233,6 +233,15 @@ const STYLES = `
 .list-item .li-act { display: flex; gap: 2px; flex-shrink: 0; }
 .list-item .li-act button { background: none; border: none; cursor: pointer; font-size: 13px; padding: 3px 5px; border-radius: 5px; color: #6b7280; }
 .list-item .li-act button:hover { background: #e5e7eb; }
+
+/* Page-open suggestions */
+.suggestions { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.suggest-chip {
+  text-align: left; padding: 7px 10px; border: 1px solid #d6dbf5; border-radius: 8px;
+  background: #f0f2ff; color: #3730a3; cursor: pointer; font-size: 12.5px; line-height: 1.35;
+  font-family: inherit;
+}
+.suggest-chip:hover { background: #e0e4ff; border-color: #a5b4fc; }
 `;
 
 export class AgentWidget {
@@ -466,28 +475,120 @@ export class AgentWidget {
     } catch {
       this.setConnected(false);
     }
-    void this.reattach();
+    // Resume an in-progress task if the agent is operating this tab; otherwise
+    // (a page the user opened themselves) offer contextual operation hints.
+    const resumed = await this.reattach();
+    if (!resumed) this.showPageSuggestions();
   }
 
   /**
    * After a navigation (or any fresh page load) the floating UI is recreated with
    * no state. Ask the background whether a task bound to this tab is still running
    * server-side and, if so, resume showing its live progress — the agent's lifecycle
-   * is independent of the page.
+   * is independent of the page. Returns true when a task was resumed.
    */
-  private async reattach(): Promise<void> {
+  private async reattach(): Promise<boolean> {
     try {
       const { task } = await sendMessage<{ task: Task | null }>({ type: 'GET_ACTIVE_TASK' });
-      if (!task) return;
+      if (!task) return false;
       this.currentSessionId = task.sessionId ?? this.currentSessionId;
       this.resetTaskRenderState();
       this.addSystemMessage('↻ 已重新接管进行中的任务');
       this.onTaskUpdate(task);
       this.notifyBadge();
       clientLog('info', 'task', '导航后重新接管任务', { status: task.status }, task.id);
+      return true;
     } catch {
-      /* ignore — no active task or backend offline */
+      return false; // no active task or backend offline
     }
+  }
+
+  /**
+   * On a freshly opened page (by the user, not the agent), show 2-3 context-aware
+   * hints about what the agent can do here, to help users discover capabilities.
+   */
+  private showPageSuggestions(): void {
+    const suggestions = this.buildSuggestions();
+    if (!suggestions.length) return;
+    this.renderSuggestions(suggestions);
+    if (!this.panel.classList.contains('open')) this.togglePanel();
+  }
+
+  /** Heuristically derive operation hints from what's actually on the page. */
+  private buildSuggestions(): Array<{ label: string; prompt: string }> {
+    const out: Array<{ label: string; prompt: string }> = [];
+    const has = (sel: string): boolean => !!document.querySelector(sel);
+    const count = (sel: string): number => document.querySelectorAll(sel).length;
+
+    const hasPassword = has('input[type="password"]');
+    const formFields = count('input:not([type="hidden"]), textarea, select');
+    const tableCount = count('table');
+    const listItems = count('ul li, ol li');
+    const linkCount = count('a[href]');
+    const imgCount = count('img');
+    const textLen = (document.body?.innerText ?? '').length;
+    const hasPagination = Array.from(document.querySelectorAll('a, button')).some((e) =>
+      /next|下一页|下页|更多|加载更多|load more|page\s*\d/i.test(e.textContent ?? '')
+    );
+
+    if (hasPassword) {
+      out.push({
+        label: '帮我填写登录表单',
+        prompt: '识别本页的登录表单并帮我填写（用户名/密码我来确认），填完先不要自动提交',
+      });
+    } else if (formFields >= 2 || has('form')) {
+      out.push({
+        label: '帮我填写这个表单',
+        prompt: '识别并帮我填写本页表单的各个字段，填完后让我确认再提交',
+      });
+    }
+    if (tableCount > 0) {
+      out.push({ label: '提取表格数据', prompt: '提取本页所有表格的数据并整理成结构化列表' });
+    } else if (listItems >= 10) {
+      out.push({ label: '采集列表数据', prompt: '提取本页列表中的所有条目信息并汇总成表格' });
+    }
+    if (hasPagination) {
+      out.push({
+        label: '翻页采集全部数据',
+        prompt: '逐页翻页并采集每一页的数据，直到没有下一页为止，最后汇总',
+      });
+    }
+    if (textLen > 1500) {
+      out.push({ label: '总结本页内容', prompt: '阅读并用要点总结这个页面的主要内容' });
+    }
+    if (linkCount > 15) {
+      out.push({ label: '提取所有链接', prompt: '提取本页所有链接并按类别汇总' });
+    }
+    if (imgCount > 5) {
+      out.push({ label: '提取所有图片', prompt: '提取本页所有图片的地址并列出' });
+    }
+    // Always-available nicety as filler.
+    out.push({ label: '切换暗色主题', prompt: '把这个页面切换成护眼的暗色主题' });
+
+    const seen = new Set<string>();
+    return out.filter((s) => (seen.has(s.label) ? false : seen.add(s.label))).slice(0, 3);
+  }
+
+  private renderSuggestions(items: Array<{ label: string; prompt: string }>): void {
+    const el = document.createElement('div');
+    el.className = 'msg agent';
+    const chips = items.map((_, i) => `<button class="suggest-chip" data-i="${i}"></button>`).join('');
+    el.innerHTML = `<div class="bubble text">💡 在这个页面，你可以让我：<div class="suggestions">${chips}</div></div>`;
+    const btns = el.querySelectorAll('.suggest-chip');
+    items.forEach((s, i) => {
+      const b = btns[i] as HTMLButtonElement;
+      b.textContent = s.label;
+      b.title = s.prompt;
+      b.addEventListener('click', () => {
+        this.input.value = s.prompt;
+        this.input.focus();
+        this.input.style.height = 'auto';
+        this.input.style.height = `${Math.min(this.input.scrollHeight, 90)}px`;
+      });
+    });
+    this.messages.appendChild(el);
+    this.scrollToBottom();
+    clientLog('info', 'ui', '展示页面操作建议', { count: items.length });
   }
 
   private setConnected(connected: boolean): void {
