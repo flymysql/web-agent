@@ -616,6 +616,50 @@ async function httpRequest(args: Record<string, unknown>): Promise<ToolOutcome> 
   }
 }
 
+/**
+ * Execute a DOM tool in the content script, then — if the action triggered a
+ * navigation — wait for the destination page to load and re-observe it, so the
+ * agent's next decision is based on the new page rather than the stale one. Unlike
+ * sendToContent it does NOT blindly re-send the action on failure (that would
+ * double-click); an unload mid-call is treated as a committed navigation.
+ */
+async function executeContentTool(
+  tabId: number,
+  tool: string,
+  args: Record<string, unknown>
+): Promise<ToolOutcome> {
+  await ensureContentReady(tabId);
+  let beforeUrl = '';
+  try {
+    beforeUrl = (await chrome.tabs.get(tabId)).url ?? '';
+  } catch {
+    /* ignore */
+  }
+  let result: ToolOutcome;
+  try {
+    result = (await chrome.tabs.sendMessage(
+      tabId,
+      { type: 'EXECUTE_TOOL', tool, args },
+      { frameId: 0 }
+    )) as ToolOutcome;
+  } catch {
+    // Page unloaded before responding: the action almost certainly caused a navigation.
+    result = { success: true, result: { navigated: true, note: 'page navigated before response' } };
+  }
+  try {
+    await new Promise((r) => setTimeout(r, 150));
+    const t = await chrome.tabs.get(tabId);
+    if (t.status === 'loading' || (t.url && t.url !== beforeUrl)) {
+      await waitForTabComplete(tabId, 15000);
+      const fresh = await getPageContextRetry(tabId);
+      if (fresh) result.pageContext = fresh;
+    }
+  } catch {
+    /* ignore */
+  }
+  return result;
+}
+
 export async function executeToolOnTab(
   tabId: number,
   tool: string,
@@ -652,7 +696,7 @@ export async function executeToolOnTab(
     case 'httpRequest':
       return httpRequest(args);
     default:
-      return sendToContent(tabId, { type: 'EXECUTE_TOOL', tool, args });
+      return executeContentTool(tabId, tool, args);
   }
 }
 

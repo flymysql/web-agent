@@ -366,6 +366,7 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
   let pageContext = task.checkpoint?.pageContext;
   let consecutiveFailures = 0;
   const actionCounts = new Map<string, number>();
+  let lastUrl: string | undefined = pageContext?.url;
 
   while (true) {
     task = getTask(taskId)!;
@@ -383,6 +384,19 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
         break;
       }
       continue;
+    }
+
+    // A navigation happened (the page URL changed): that IS progress, so reset the
+    // stuck/failure detectors. Otherwise a multi-page task that calls extractPage once
+    // per page would falsely trip the "repeated action" guard.
+    if (pageContext.url && pageContext.url !== lastUrl) {
+      if (lastUrl !== undefined) {
+        actionCounts.clear();
+        consecutiveFailures = 0;
+        addLog(taskId, 'info', `📄 页面已跳转，继续执行：${pageContext.url}`);
+        emit(taskId);
+      }
+      lastUrl = pageContext.url;
     }
 
     let decision;

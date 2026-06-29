@@ -713,10 +713,15 @@ export class AgentWidget {
     for (const log of task.logs ?? []) {
       if (this.renderedLogIds.has(log.id)) continue;
       this.renderedLogIds.add(log.id);
-      if (log.level === 'info' && log.message.startsWith('Executing step')) {
-        this.addSystemMessage(`⚙️ ${log.message}`);
-      } else if (log.level === 'error') {
-        this.addSystemMessage(`❌ ${log.message}`);
+      const m = log.message;
+      if (log.level === 'error') {
+        this.addSystemMessage(`❌ ${m}`);
+      } else if (m.startsWith('🤔')) {
+        this.addSystemMessage(m); // agent thought
+      } else if (m.startsWith('📄')) {
+        this.addSystemMessage(m); // page navigation
+      } else if (m.startsWith('执行:') || m.startsWith('Executing step')) {
+        this.addSystemMessage(`⚙️ ${m}`); // tool execution step
       }
     }
 
