@@ -9,15 +9,25 @@ type ContentMessage = {
   args?: Record<string, unknown>;
 };
 
-const isTopFrame = window.top === window.self;
+declare global {
+  interface Window {
+    __AI_AGENT_CONTENT__?: boolean;
+  }
+}
 
-// With all_frames enabled the script also loads in sub-frames; only the top
-// frame acts as the responder/UI so background messages get a single answer.
-// The top frame's perception pierces same-origin iframes directly.
-if (isTopFrame) {
+// Guard against double-execution: the content script may run from the manifest
+// (document_idle) AND be re-injected programmatically by the background after a
+// navigation. Registering listeners twice would cause duplicate responses.
+if (!window.__AI_AGENT_CONTENT__) {
+  window.__AI_AGENT_CONTENT__ = true;
+
   chrome.runtime.onMessage.addListener((message: ContentMessage, _sender, sendResponse) => {
     const handle = async () => {
       switch (message.type) {
+        case 'PING':
+          // Readiness probe used by the background to know the script is alive.
+          return { ready: true };
+
         case 'GET_PAGE_CONTEXT':
           return { success: true, pageContext: extractPageContext() };
 
@@ -39,12 +49,17 @@ if (isTopFrame) {
     return true;
   });
 
+  const boot = () => initFloatingUI();
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initFloatingUI);
+    document.addEventListener('DOMContentLoaded', boot);
   } else {
-    initFloatingUI();
+    boot();
   }
 
-  chrome.runtime.sendMessage({ type: 'PAGE_LOADED', url: location.href }).catch(() => {});
-  console.log('[AI Browser Agent] Content script loaded (top frame)');
+  // Let the background know a top-level page loaded (drives auto-run workflows).
+  if (window.top === window.self) {
+    chrome.runtime.sendMessage({ type: 'PAGE_LOADED', url: location.href }).catch(() => {});
+  }
+
+  console.log('[AI Browser Agent] Content script loaded');
 }

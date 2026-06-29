@@ -466,6 +466,28 @@ export class AgentWidget {
     } catch {
       this.setConnected(false);
     }
+    void this.reattach();
+  }
+
+  /**
+   * After a navigation (or any fresh page load) the floating UI is recreated with
+   * no state. Ask the background whether a task bound to this tab is still running
+   * server-side and, if so, resume showing its live progress — the agent's lifecycle
+   * is independent of the page.
+   */
+  private async reattach(): Promise<void> {
+    try {
+      const { task } = await sendMessage<{ task: Task | null }>({ type: 'GET_ACTIVE_TASK' });
+      if (!task) return;
+      this.currentSessionId = task.sessionId ?? this.currentSessionId;
+      this.resetTaskRenderState();
+      this.addSystemMessage('↻ 已重新接管进行中的任务');
+      this.onTaskUpdate(task);
+      this.notifyBadge();
+      clientLog('info', 'task', '导航后重新接管任务', { status: task.status }, task.id);
+    } catch {
+      /* ignore — no active task or backend offline */
+    }
   }
 
   private setConnected(connected: boolean): void {
