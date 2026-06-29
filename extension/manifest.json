@@ -7,7 +7,10 @@
     "activeTab",
     "scripting",
     "storage",
-    "tabs"
+    "tabs",
+    "cookies",
+    "downloads",
+    "webRequest"
   ],
   "host_permissions": [
     "http://localhost:3847/*",
@@ -31,7 +34,8 @@
     {
       "matches": ["<all_urls>"],
       "js": ["src/content/index.ts"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true
     }
   ],
   "icons": {

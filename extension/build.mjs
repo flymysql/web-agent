@@ -46,11 +46,21 @@ const entries = [
   { entry: 'src/background/service-worker.ts', out: 'service-worker.js' },
   { entry: 'src/content/index.ts', out: 'content.js' },
   { entry: 'src/popup/popup.ts', out: 'popup.js' },
+  { entry: 'src/options/options.ts', out: 'options.js' },
 ];
 
 function copyStatic() {
   cpSync(resolve(root, 'icons'), resolve(outDir, 'icons'), { recursive: true });
   cpSync(resolve(root, 'src/popup/popup.css'), resolve(outDir, 'popup.css'));
+  cpSync(resolve(root, 'src/options/options.css'), resolve(outDir, 'options.css'));
+
+  const optionsHtml = readFileSync(resolve(root, 'src/options/options.html'), 'utf8')
+    .replace('./options.css', 'options.css')
+    .replace(
+      '<script src="./options.ts" type="module"></script>',
+      '<script src="options.js"></script>'
+    );
+  writeFileSync(resolve(outDir, 'options.html'), optionsHtml);
 
   const html = readFileSync(resolve(root, 'src/popup/index.html'), 'utf8')
     .replace('./popup.css', 'popup.css')
@@ -63,9 +73,10 @@ function copyStatic() {
   const manifest = JSON.parse(readFileSync(resolve(root, 'manifest.json'), 'utf8'));
   manifest.background = { service_worker: 'service-worker.js' };
   manifest.content_scripts = [
-    { matches: ['<all_urls>'], js: ['content.js'], run_at: 'document_idle' },
+    { matches: ['<all_urls>'], js: ['content.js'], run_at: 'document_idle', all_frames: true },
   ];
   manifest.action.default_popup = 'popup.html';
+  manifest.options_ui = { page: 'options.html', open_in_tab: true };
   writeFileSync(resolve(outDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
 }
 

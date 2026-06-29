@@ -9,34 +9,42 @@ type ContentMessage = {
   args?: Record<string, unknown>;
 };
 
-chrome.runtime.onMessage.addListener((message: ContentMessage, _sender, sendResponse) => {
-  const handle = async () => {
-    switch (message.type) {
-      case 'GET_PAGE_CONTEXT':
-        return { success: true, pageContext: extractPageContext() };
+const isTopFrame = window.top === window.self;
 
-      case 'EXECUTE_TOOL': {
-        if (!message.tool) {
-          return { success: false, error: 'tool name required' };
+// With all_frames enabled the script also loads in sub-frames; only the top
+// frame acts as the responder/UI so background messages get a single answer.
+// The top frame's perception pierces same-origin iframes directly.
+if (isTopFrame) {
+  chrome.runtime.onMessage.addListener((message: ContentMessage, _sender, sendResponse) => {
+    const handle = async () => {
+      switch (message.type) {
+        case 'GET_PAGE_CONTEXT':
+          return { success: true, pageContext: extractPageContext() };
+
+        case 'EXECUTE_TOOL': {
+          if (!message.tool) {
+            return { success: false, error: 'tool name required' };
+          }
+          const result = await executeBrowserTool(message.tool, message.args ?? {});
+          const pageContext = extractPageContext();
+          return { ...result, pageContext };
         }
-        const result = await executeBrowserTool(message.tool, message.args ?? {});
-        const pageContext = extractPageContext();
-        return { ...result, pageContext };
+
+        default:
+          return { success: false, error: `Unknown message type: ${message.type}` };
       }
+    };
 
-      default:
-        return { success: false, error: `Unknown message type: ${message.type}` };
-    }
-  };
+    handle().then(sendResponse);
+    return true;
+  });
 
-  handle().then(sendResponse);
-  return true;
-});
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initFloatingUI);
+  } else {
+    initFloatingUI();
+  }
 
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', initFloatingUI);
-} else {
-  initFloatingUI();
+  chrome.runtime.sendMessage({ type: 'PAGE_LOADED', url: location.href }).catch(() => {});
+  console.log('[AI Browser Agent] Content script loaded (top frame)');
 }
-
-console.log('[AI Browser Agent] Content script loaded');

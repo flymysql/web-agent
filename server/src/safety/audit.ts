@@ -52,12 +52,11 @@ export function requiresConfirmation(
     return { required: true, reason: `Tool ${tool} requires confirmation` };
   }
 
-  const textToCheck = [
-    stepDescription ?? '',
-    JSON.stringify(args),
-    String(args.text ?? ''),
-    String(args.selector ?? ''),
-  ].join(' ').toLowerCase();
+  // Only scan intent-bearing fields, NOT payloads like code/css/html/body —
+  // otherwise CSS/JS containing words like "post"/"remove" cause false positives.
+  const SCAN_FIELDS = ['selector', 'url', 'text', 'value', 'title', 'message', 'name', 'attribute', 'query'];
+  const argText = SCAN_FIELDS.map((k) => String((args as Record<string, unknown>)[k] ?? '')).join(' ');
+  const textToCheck = [stepDescription ?? '', argText].join(' ').toLowerCase();
 
   for (const kw of DANGEROUS_KEYWORDS) {
     if (textToCheck.includes(kw)) {

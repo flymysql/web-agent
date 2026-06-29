@@ -1,7 +1,7 @@
 import type { TaskStatus } from '@ai-browser-agent/shared';
 
 const VALID_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
-  pending: ['planning', 'cancelled'],
+  pending: ['planning', 'running', 'cancelled'],
   planning: ['running', 'failed', 'cancelled'],
   running: ['paused', 'waiting_confirmation', 'completed', 'failed', 'cancelled'],
   paused: ['running', 'cancelled'],

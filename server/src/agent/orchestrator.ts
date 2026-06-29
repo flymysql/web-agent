@@ -9,13 +9,14 @@ import type {
 import { isBrowserTool, isBackendTool } from '@ai-browser-agent/shared';
 import {
   getTask,
+  createTask,
   updateTask,
   addLog,
   saveCheckpoint,
   setPageContext,
 } from '../tasks/store.js';
 import { assertTransition, isTerminalStatus } from '../tasks/state-machine.js';
-import { createPlan, replanFromFailure } from './planner.js';
+import { createPlan } from './planner.js';
 import {
   requiresConfirmation,
   recordAudit,
@@ -23,12 +24,18 @@ import {
   assessToolRisk,
 } from '../safety/audit.js';
 import { executeBackendTool } from '../tools/registry.js';
+import { buildConversationContext } from '../sessions/store.js';
+import { getWorkflow } from '../workflows/store.js';
+import { getRuntimeConfig } from '../config/runtime-config.js';
+import { debugLog } from '../debug/logger.js';
 import {
   decideNextAction,
   type AgentHistoryItem,
 } from '../llm/provider.js';
 
-const DEFAULT_MAX_AGENT_STEPS = 15;
+function getDefaultMaxSteps(): number {
+  return getRuntimeConfig().maxSteps ?? parseInt(process.env.AGENT_MAX_STEPS ?? '40', 10);
+}
 const MAX_CONSECUTIVE_FAILURES = 3;
 
 export type ToolExecutor = (
@@ -44,6 +51,18 @@ export function setBrowserToolExecutor(executor: ToolExecutor): void {
   browserToolExecutor = executor;
 }
 
+let taskUpdateNotifier: ((taskId: string) => void) | null = null;
+export function setTaskUpdateNotifier(fn: (taskId: string) => void): void {
+  taskUpdateNotifier = fn;
+}
+function emit(taskId: string): void {
+  try {
+    taskUpdateNotifier?.(taskId);
+  } catch {
+    /* ignore notifier errors */
+  }
+}
+
 export async function planTask(taskId: string, pageContext?: PageContext): Promise<Task> {
   let task = getTask(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
@@ -52,7 +71,8 @@ export async function planTask(taskId: string, pageContext?: PageContext): Promi
   task = updateTask(taskId, { status: 'planning' });
   addLog(taskId, 'info', 'Planning task...');
 
-  const plan = await createPlan(task.userRequest, pageContext);
+  const conversationContext = buildConversationContext(task.sessionId, taskId);
+  const plan = await createPlan(task.userRequest, pageContext, conversationContext);
   task = updateTask(taskId, { plan, status: 'pending' });
   addLog(taskId, 'info', `Plan created with ${plan.steps.length} steps`);
 
@@ -96,6 +116,7 @@ async function runReplay(taskId: string): Promise<Task> {
 
     const step = plan.steps[task.currentStepIndex];
     addLog(taskId, 'info', `Executing step ${task.currentStepIndex + 1}: ${step.description}`);
+    emit(taskId);
 
     const confirmation = requiresConfirmation(step.tool, step.args, step.description);
     if (confirmation.required && !step.requiresConfirmation) {
@@ -121,20 +142,19 @@ async function runReplay(taskId: string): Promise<Task> {
 
     if (!result.success) {
       addLog(taskId, 'error', `Step failed: ${result.error}`, { step: step.id });
+      emit(taskId);
 
-      if (task.currentStepIndex < 2) {
-        const retrySteps = replanFromFailure(
-          task.userRequest,
-          task.checkpoint?.pageContext,
-          step,
-          result.error ?? 'unknown'
-        );
-        task = updateTask(taskId, {
-          plan: {
-            ...task.plan!,
-            steps: [...task.plan!.steps.slice(0, task.currentStepIndex), ...retrySteps],
-          },
+      // Adaptive recovery: re-observe the page and let the LLM re-locate / fix this step.
+      const recovered = await recoverReplayStep(task, step, result.error ?? 'unknown');
+      if (recovered) {
+        addLog(taskId, 'info', `已通过自适应重定位恢复步骤 ${task.currentStepIndex + 1}`);
+        if (recovered.pageContext) setPageContext(taskId, recovered.pageContext);
+        saveCheckpoint(taskId, {
+          stepIndex: task.currentStepIndex + 1,
+          pageContext: recovered.pageContext ?? task.checkpoint?.pageContext,
         });
+        task = updateTask(taskId, { currentStepIndex: task.currentStepIndex + 1 });
+        emit(taskId);
         continue;
       }
 
@@ -142,6 +162,7 @@ async function runReplay(taskId: string): Promise<Task> {
         status: 'failed',
         error: result.error,
       });
+      emit(taskId);
       break;
     }
 
@@ -156,6 +177,7 @@ async function runReplay(taskId: string): Promise<Task> {
     });
 
     task = updateTask(taskId, { currentStepIndex: task.currentStepIndex + 1 });
+    emit(taskId);
   }
 
   task = getTask(taskId)!;
@@ -190,6 +212,7 @@ async function runReplay(taskId: string): Promise<Task> {
     }
   }
 
+  emit(taskId);
   return task;
 }
 
@@ -220,10 +243,22 @@ function summarizeToolResult(tool: string, result: unknown): string {
   }
 }
 
+function compactArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(args)) {
+    if (typeof v === 'string' && v.length > 300) {
+      out[k] = `${v.slice(0, 120)}…<${v.length} chars omitted>`;
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
 function buildHistory(task: Task): AgentHistoryItem[] {
   return task.toolCalls.map((c) => ({
     tool: c.tool,
-    args: c.args,
+    args: compactArgs(c.args),
     success: !c.error,
     error: c.error,
     result: c.error ? undefined : summarizeToolResult(c.tool, c.result),
@@ -269,6 +304,35 @@ function recordWorkflowDraft(task: Task): WorkflowStep[] {
     }));
 }
 
+async function recoverReplayStep(
+  task: Task,
+  step: PlanStep,
+  error: string
+): Promise<{ pageContext?: PageContext } | null> {
+  try {
+    const ctx = await observePage(task);
+    if (!ctx) return null;
+    const decision = await decideNextAction(
+      `${task.userRequest}\n当前需要完成的步骤: ${step.description}（原工具 ${step.tool} 失败: ${error}）。` +
+        `请使用当前页面真实存在的选择器重做这一步，只输出这一个动作。`,
+      ctx,
+      buildHistory(task),
+      task.plan,
+      undefined
+    );
+    const action = decision.action;
+    if (!action?.tool) return null;
+    const res = await executeStep(
+      task,
+      makeSyntheticStep(action.tool, action.args, decision.thought || action.tool)
+    );
+    if (res.success) return { pageContext: res.pageContext };
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function observePage(task: Task): Promise<PageContext | undefined> {
   const obs = await executeStep(task, makeSyntheticStep('extractPage', {}, '观察页面'));
   if (obs.pageContext) {
@@ -297,9 +361,11 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
     addLog(taskId, 'info', 'Agent 继续执行');
   }
 
-  const maxSteps = task.maxSteps ?? DEFAULT_MAX_AGENT_STEPS;
+  const maxSteps = task.maxSteps ?? getDefaultMaxSteps();
+  const conversationContext = buildConversationContext(task.sessionId, taskId);
   let pageContext = task.checkpoint?.pageContext;
   let consecutiveFailures = 0;
+  const actionCounts = new Map<string, number>();
 
   while (true) {
     task = getTask(taskId)!;
@@ -309,6 +375,7 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
     if (task.currentStepIndex >= maxSteps) break;
 
     if (!pageContext) {
+      addLog(taskId, 'info', '执行: extractPage');
       pageContext = await observePage(task);
       task = updateTask(taskId, { currentStepIndex: task.currentStepIndex + 1 });
       if (!pageContext) {
@@ -320,7 +387,7 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
 
     let decision;
     try {
-      decision = await decideNextAction(task.userRequest, pageContext, buildHistory(task), task.plan);
+      decision = await decideNextAction(task.userRequest, pageContext, buildHistory(task), task.plan, conversationContext);
     } catch (err) {
       task = updateTask(taskId, {
         status: 'failed',
@@ -329,15 +396,22 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
       break;
     }
 
-    if (decision.thought) addLog(taskId, 'info', `🤔 ${decision.thought}`);
+    if (decision.thought) {
+      addLog(taskId, 'info', `🤔 ${decision.thought}`);
+      emit(taskId);
+    }
 
     if (decision.done) {
+      // Final verification: re-observe so the recorded result reflects the true end state.
+      const finalCtx = await observePage(task);
+      if (finalCtx) pageContext = finalCtx;
       task = updateTask(taskId, {
         status: 'completed',
         result: decision.summary ?? summarizeResult(task),
         recordedSteps: recordWorkflowDraft(task),
       });
       addLog(taskId, 'info', 'Agent 判定任务完成');
+      emit(taskId);
       break;
     }
 
@@ -352,6 +426,19 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
       continue;
     }
 
+    const sig = `${action.tool}:${JSON.stringify(action.args)}`;
+    const seen = (actionCounts.get(sig) ?? 0) + 1;
+    actionCounts.set(sig, seen);
+    if (seen >= 3) {
+      task = updateTask(taskId, {
+        status: 'failed',
+        error: `检测到重复动作(${action.tool})已 ${seen} 次仍无进展，已停止以避免卡死。`,
+      });
+      addLog(taskId, 'warn', `检测到重复动作，已停止: ${sig.slice(0, 120)}`);
+      emit(taskId);
+      break;
+    }
+
     const confirmation = requiresConfirmation(action.tool, action.args, decision.thought);
     if (confirmation.required) {
       task = updateTask(taskId, {
@@ -364,10 +451,12 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
         },
       });
       addLog(taskId, 'warn', `需要确认高风险操作: ${action.tool}`);
+      emit(taskId);
       break;
     }
 
     addLog(taskId, 'info', `执行: ${action.tool}`);
+    emit(taskId);
     const result = await executeStep(
       task,
       makeSyntheticStep(action.tool, action.args, decision.thought || action.tool)
@@ -383,6 +472,7 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
       addLog(taskId, 'error', `步骤失败: ${result.error}`);
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
         task = updateTask(taskId, { status: 'failed', error: result.error });
+        emit(taskId);
         break;
       }
     } else {
@@ -390,6 +480,7 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
     }
 
     task = updateTask(taskId, { currentStepIndex: task.currentStepIndex + 1 });
+    emit(taskId);
   }
 
   task = getTask(taskId)!;
@@ -410,12 +501,16 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
     } else if (task.currentStepIndex >= maxSteps) {
       task = updateTask(taskId, {
         status: 'completed',
-        result: `${summarizeResult(task)}\n(已达最大步数 ${maxSteps})`,
+        result:
+          `${summarizeResult(task)}\n\n⚠️ 已达到单次步数上限（${maxSteps} 步）后停止，任务可能尚未完全完成。` +
+          `如需继续，请回复“继续”，或在 .env 中调大 AGENT_MAX_STEPS。`,
         recordedSteps: recordWorkflowDraft(task),
       });
+      addLog(taskId, 'warn', `已达最大步数 ${maxSteps}，停止执行`);
     }
   }
 
+  emit(taskId);
   return task;
 }
 
@@ -472,6 +567,22 @@ async function executeStep(
   record.result = result.result;
   record.error = result.error;
 
+  debugLog({
+    source: 'tool',
+    level: result.success ? 'info' : 'error',
+    category: step.tool,
+    message: result.success
+      ? `✓ ${step.tool} (${(record.completedAt ?? 0) - record.startedAt}ms)`
+      : `✗ ${step.tool}: ${result.error}`,
+    taskId: task.id,
+    data: {
+      args: masked,
+      durationMs: (record.completedAt ?? 0) - record.startedAt,
+      result: result.success ? summarizeToolResult(step.tool, result.result) : undefined,
+      error: result.error,
+    },
+  });
+
   updateTask(task.id, {
     toolCalls: [...task.toolCalls, record],
   });
@@ -480,18 +591,17 @@ async function executeStep(
 }
 
 function summarizeResult(task: Task): string {
-  const parts = [`Completed: ${task.userRequest}`];
-  parts.push(`Steps executed: ${task.currentStepIndex}/${task.plan?.steps.length ?? 0}`);
+  const okCalls = task.toolCalls.filter((c) => !c.error);
+  const usedTools = Array.from(new Set(okCalls.map((c) => c.tool)));
+  const parts = [`已完成：${task.userRequest}`];
+  parts.push(
+    `共执行 ${okCalls.length} 个操作${usedTools.length ? `（${usedTools.join('、')}）` : ''}`
+  );
 
   const lastRead = [...task.toolCalls].reverse().find((c) => c.tool === 'readText' && c.result);
   if (lastRead?.result) {
     const text = (lastRead.result as { text?: string }).text;
-    if (text) parts.push(`Extracted text: ${text.slice(0, 500)}...`);
-  }
-
-  const extracts = task.toolCalls.filter((c) => c.tool === 'extractPage' && !c.error);
-  if (extracts.length > 0) {
-    parts.push(`Page extractions: ${extracts.length}`);
+    if (text) parts.push(`读取内容：${text.slice(0, 400)}…`);
   }
 
   return parts.join('\n');
@@ -576,6 +686,60 @@ export async function confirmPendingAction(taskId: string, confirmed: boolean): 
   });
 
   return runReplay(taskId);
+}
+
+function applyParams(value: unknown, params: Record<string, string>): unknown {
+  if (typeof value === 'string') {
+    return value.replace(/\{\{(\w+)\}\}/g, (_, k: string) => params[k] ?? `{{${k}}}`);
+  }
+  if (Array.isArray(value)) return value.map((v) => applyParams(v, params));
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = applyParams(v, params);
+    return out;
+  }
+  return value;
+}
+
+/** Run a saved workflow as a deterministic replay task. */
+export async function runWorkflow(
+  workflowId: string,
+  params: Record<string, string> = {},
+  tabId?: number,
+  url?: string
+): Promise<Task> {
+  const wf = getWorkflow(workflowId);
+  if (!wf) throw new Error(`Workflow not found: ${workflowId}`);
+
+  const merged: Record<string, string> = {};
+  for (const p of wf.params) merged[p.key] = p.default ?? '';
+  Object.assign(merged, params);
+
+  const steps: PlanStep[] = wf.steps.map((step) => ({
+    id: uuidv4(),
+    description: step.description,
+    tool: step.tool,
+    args: applyParams(step.args, merged) as Record<string, unknown>,
+    riskLevel: step.riskLevel,
+    requiresConfirmation: step.requiresConfirmation,
+  }));
+
+  // Replay starts from a known URL so saved selectors resolve against the right page.
+  if (wf.startUrl && steps[0]?.tool !== 'navigate') {
+    steps.unshift({
+      id: uuidv4(),
+      description: `打开起始页 ${wf.startUrl}`,
+      tool: 'navigate',
+      args: { url: wf.startUrl },
+      riskLevel: 'low',
+      requiresConfirmation: false,
+    });
+  }
+
+  const task = createTask({ userRequest: `▶️ 工作流：${wf.name}`, mode: 'replay', workflowId, tabId, url });
+  updateTask(task.id, { plan: { goal: wf.name, steps } });
+  addLog(task.id, 'info', `运行工作流：${wf.name}（${steps.length} 步）`);
+  return runTask(task.id);
 }
 
 export async function pauseTask(taskId: string): Promise<Task> {

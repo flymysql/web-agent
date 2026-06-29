@@ -1,9 +1,12 @@
 import type { WebSocket } from 'ws';
 import type { WsMessage } from '@ai-browser-agent/shared';
 import { getActiveLoopTasks, getTask } from '../tasks/store.js';
-import { runTask } from '../agent/orchestrator.js';
+import { runTask, runWorkflow } from '../agent/orchestrator.js';
+import { getWorkflowsByTrigger } from '../workflows/store.js';
 
 const scheduledTasks = new Map<string, ReturnType<typeof setInterval>>();
+const scheduledWorkflows = new Map<string, { timer: ReturnType<typeof setInterval>; intervalMs: number }>();
+const DEFAULT_WORKFLOW_INTERVAL_MS = 60000;
 
 let broadcastTaskUpdate: ((taskId: string) => void) | null = null;
 let isExtensionConnected = false;
@@ -58,6 +61,49 @@ export function unscheduleLoopTask(taskId: string): void {
   }
 }
 
+function scheduleWorkflow(workflowId: string, intervalMs: number): void {
+  const existing = scheduledWorkflows.get(workflowId);
+  if (existing && existing.intervalMs === intervalMs) return;
+  if (existing) clearInterval(existing.timer);
+
+  const timer = setInterval(async () => {
+    if (!isExtensionConnected) return;
+    try {
+      const task = await runWorkflow(workflowId);
+      broadcastTaskUpdate?.(task.id);
+    } catch (err) {
+      console.error(`[Scheduler] Workflow run error ${workflowId}:`, err);
+    }
+  }, intervalMs);
+
+  scheduledWorkflows.set(workflowId, { timer, intervalMs });
+  console.log(`[Scheduler] Workflow scheduled: ${workflowId} every ${intervalMs}ms`);
+}
+
+function unscheduleWorkflow(workflowId: string): void {
+  const entry = scheduledWorkflows.get(workflowId);
+  if (entry) {
+    clearInterval(entry.timer);
+    scheduledWorkflows.delete(workflowId);
+    console.log(`[Scheduler] Workflow unscheduled: ${workflowId}`);
+  }
+}
+
+/** Reconcile timers with the current set of 'scheduled' workflows. */
+export function syncWorkflowSchedules(): void {
+  const scheduled = getWorkflowsByTrigger('scheduled');
+  const wanted = new Set<string>();
+  for (const wf of scheduled) {
+    const trig = wf.triggers.find((t) => t.type === 'scheduled');
+    const intervalMs = trig?.intervalMs && trig.intervalMs >= 5000 ? trig.intervalMs : DEFAULT_WORKFLOW_INTERVAL_MS;
+    wanted.add(wf.id);
+    scheduleWorkflow(wf.id, intervalMs);
+  }
+  for (const id of scheduledWorkflows.keys()) {
+    if (!wanted.has(id)) unscheduleWorkflow(id);
+  }
+}
+
 export function startScheduler(): void {
   setInterval(async () => {
     if (!isExtensionConnected) return;
@@ -70,6 +116,7 @@ export function startScheduler(): void {
     }
   }, 10000);
 
+  syncWorkflowSchedules();
   console.log('[Scheduler] Started');
 }
 

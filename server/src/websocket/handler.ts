@@ -21,6 +21,7 @@ import {
   resumeTask,
   confirmPendingAction,
   setBrowserToolExecutor,
+  setTaskUpdateNotifier,
 } from '../agent/orchestrator.js';
 import {
   scheduleLoopTask,
@@ -95,13 +96,14 @@ function executeBrowserToolViaWs(
     send(session.ws, {
       id: uuidv4(),
       type: 'tool.execute',
-      payload: { taskId, tool, args, callId } satisfies ToolExecutePayload,
+      payload: { taskId, tool, args, callId, tabId: getTask(taskId)?.tabId } satisfies ToolExecutePayload,
       timestamp: Date.now(),
     });
   });
 }
 
 setBrowserToolExecutor(executeBrowserToolViaWs);
+setTaskUpdateNotifier(broadcastTaskUpdate);
 
 export function handleWebSocketConnection(ws: WebSocket): void {
   ws.on('message', async (data) => {

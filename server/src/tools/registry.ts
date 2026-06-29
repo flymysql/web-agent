@@ -11,34 +11,12 @@ export async function executeBackendTool(
 
   try {
     switch (tool) {
-      case 'fetch': {
-        const url = args.url as string;
-        const method = (args.method as string) ?? 'GET';
-        const headers = (args.headers as Record<string, string>) ?? {};
-        const body = args.body as string | undefined;
-
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 30000);
-
-        const res = await fetch(url, {
-          method,
-          headers,
-          body,
-          signal: controller.signal,
-        });
-        clearTimeout(timeout);
-
-        const text = await res.text();
+      case 'fetch':
         return {
-          success: res.ok,
-          result: {
-            status: res.status,
-            statusText: res.statusText,
-            body: text.slice(0, 10000),
-          },
-          error: res.ok ? undefined : `HTTP ${res.status}`,
+          success: false,
+          error:
+            'Server-side fetch is disabled. Use the browser tools httpRequest / webSearch / imageSearch instead (they run in the browser and have network access).',
         };
-      }
 
       case 'notify':
         return {

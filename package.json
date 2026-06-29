@@ -13,6 +13,9 @@
     "copy:extension": "rm -rf chrome-extension && cp -R extension/dist chrome-extension",
     "dev:server": "npm run dev -w server",
     "dev:extension": "npm run dev -w extension",
+    "start": "npm run start -w server",
+    "test": "node --import tsx --test shared/test/*.test.ts server/test/*.test.ts",
+    "package:extension": "npm run build && cd chrome-extension && zip -r -X ../ai-browser-agent-extension.zip .",
     "typecheck": "npm run typecheck -w shared && npm run typecheck -w extension && npm run typecheck -w server"
   },
   "engines": {

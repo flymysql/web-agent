@@ -26,10 +26,11 @@ function makeStep(
  */
 export async function createPlan(
   userRequest: string,
-  pageContext?: PageContext
+  pageContext?: PageContext,
+  conversationContext?: string
 ): Promise<TaskPlan> {
   try {
-    return await generatePlanWithLLM(userRequest, pageContext);
+    return await generatePlanWithLLM(userRequest, pageContext, conversationContext);
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     throw new Error(

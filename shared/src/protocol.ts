@@ -94,6 +94,8 @@ export interface ToolExecutePayload {
   tool: string;
   args: Record<string, unknown>;
   callId: string;
+  /** Tab the task is bound to; extension should target this tab (falls back to active tab) */
+  tabId?: number;
 }
 
 export interface ToolResultPayload {

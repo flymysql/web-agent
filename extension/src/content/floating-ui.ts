@@ -1,4 +1,10 @@
-import type { Task, TaskLogEntry, PlanStep } from '@ai-browser-agent/shared';
+import type {
+  Task,
+  TaskLogEntry,
+  PlanStep,
+  Workflow,
+  ChatSession,
+} from '@ai-browser-agent/shared';
 
 type AgentState = 'idle' | 'thinking' | 'working' | 'happy' | 'error' | 'waiting';
 
@@ -6,6 +12,26 @@ const BALL_POS_KEY = 'agent_ball_pos';
 
 function sendMessage<T>(message: object): Promise<T> {
   return chrome.runtime.sendMessage(message) as Promise<T>;
+}
+
+/** Forward a UI/flow log to the background → backend debug log (fire-and-forget). */
+function clientLog(
+  level: 'debug' | 'info' | 'warn' | 'error',
+  category: string,
+  message: string,
+  data?: unknown,
+  taskId?: string
+): void {
+  try {
+    chrome.runtime
+      .sendMessage({
+        type: 'CLIENT_LOG',
+        entry: { level, category, message, data, taskId, ts: Date.now() },
+      })
+      .catch(() => {});
+  } catch {
+    /* ignore */
+  }
 }
 
 /** Robot mascot as inline SVG. Expression driven by state. */
@@ -179,6 +205,34 @@ const STYLES = `
 .composer .opts { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 11px; color: #6b7280; }
 .composer .opts input[type="number"] { width: 78px; padding: 2px 6px; border: 1px solid #d1d5db; border-radius: 5px; font-size: 11px; }
 .composer .opts input[type="number"]:disabled { opacity: 0.5; }
+
+/* Drawers: sessions + workflows */
+.drawer {
+  position: absolute; left: 0; right: 0; top: 50px; bottom: 0;
+  background: #fff; z-index: 6; display: none; flex-direction: column;
+}
+.drawer.open { display: flex; animation: popIn 0.15s ease-out; }
+.drawer-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 11px 14px; border-bottom: 1px solid #eceef5; font-size: 13px; font-weight: 600; color: #1a1a2e;
+}
+.drawer-head .drawer-close { background: none; border: none; font-size: 18px; line-height: 1; cursor: pointer; color: #9ca3af; }
+.drawer-head .drawer-close:hover { color: #374151; }
+.drawer-body { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.drawer-foot { padding: 10px; border-top: 1px solid #eceef5; }
+.drawer-action { width: 100%; padding: 8px; border: none; border-radius: 8px; background: #4f46e5; color: #fff; cursor: pointer; font-size: 13px; }
+.drawer-action:hover { background: #4338ca; }
+.drawer-empty { text-align: center; color: #9ca3af; font-size: 12px; padding: 26px 12px; line-height: 1.6; }
+
+.list-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid #eceef5; border-radius: 8px; }
+.list-item:hover { background: #f7f8fc; }
+.list-item.active { border-color: #a5b4fc; background: #eef2ff; }
+.list-item .li-main { flex: 1; min-width: 0; cursor: pointer; }
+.list-item .li-title { font-size: 13px; color: #1a1a2e; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.list-item .li-sub { font-size: 11px; color: #9ca3af; margin-top: 2px; }
+.list-item .li-act { display: flex; gap: 2px; flex-shrink: 0; }
+.list-item .li-act button { background: none; border: none; cursor: pointer; font-size: 13px; padding: 3px 5px; border-radius: 5px; color: #6b7280; }
+.list-item .li-act button:hover { background: #e5e7eb; }
 `;
 
 export class AgentWidget {
@@ -192,7 +246,14 @@ export class AgentWidget {
   private badge!: HTMLDivElement;
   private loopChk!: HTMLInputElement;
   private loopInterval!: HTMLInputElement;
+  private sessionDrawer!: HTMLDivElement;
+  private wfDrawer!: HTMLDivElement;
+  private sessionList!: HTMLDivElement;
+  private wfList!: HTMLDivElement;
 
+  private currentSessionId: string | null = null;
+  private sessions: ChatSession[] = [];
+  private savedWorkflowFor = new Set<string>();
   private currentTask: Task | null = null;
   private renderedLogIds = new Set<string>();
   private planRenderedFor: string | null = null;
@@ -233,6 +294,9 @@ export class AgentWidget {
         <div class="avatar">${mascotSvg()}</div>
         <div class="title">AI 助手</div>
         <div class="status-dot"></div>
+        <button class="new-btn" title="新建会话">➕</button>
+        <button class="session-btn" title="会话历史">🕘</button>
+        <button class="wf-btn" title="工作流仓库">🗂</button>
         <button class="min-btn" title="收起">—</button>
       </div>
       <div class="messages"></div>
@@ -245,6 +309,15 @@ export class AgentWidget {
           <label><input type="checkbox" class="loop-chk"> 循环任务</label>
           <input type="number" class="loop-interval" value="60000" min="5000" disabled> ms
         </div>
+      </div>
+      <div class="drawer session-drawer">
+        <div class="drawer-head"><span>会话历史</span><button class="drawer-close" title="关闭">×</button></div>
+        <div class="drawer-body session-list"></div>
+        <div class="drawer-foot"><button class="drawer-action new-session-btn">+ 新建会话</button></div>
+      </div>
+      <div class="drawer wf-drawer">
+        <div class="drawer-head"><span>工作流仓库</span><button class="drawer-close" title="关闭">×</button></div>
+        <div class="drawer-body wf-list"></div>
       </div>`;
     this.root.appendChild(panel);
     this.panel = panel;
@@ -254,6 +327,10 @@ export class AgentWidget {
     this.statusDot = panel.querySelector('.status-dot') as HTMLDivElement;
     this.loopChk = panel.querySelector('.loop-chk') as HTMLInputElement;
     this.loopInterval = panel.querySelector('.loop-interval') as HTMLInputElement;
+    this.sessionDrawer = panel.querySelector('.session-drawer') as HTMLDivElement;
+    this.wfDrawer = panel.querySelector('.wf-drawer') as HTMLDivElement;
+    this.sessionList = panel.querySelector('.session-list') as HTMLDivElement;
+    this.wfList = panel.querySelector('.wf-list') as HTMLDivElement;
 
     this.restorePosition();
     this.addAgentMessage('你好！我是你的页面助手 🤖\n描述你想完成的任务，我会先制定计划再执行。');
@@ -342,6 +419,14 @@ export class AgentWidget {
     (this.panel.querySelector('.min-btn') as HTMLButtonElement).addEventListener('click', () => {
       this.panel.classList.remove('open');
     });
+
+    (this.panel.querySelector('.new-btn') as HTMLButtonElement).addEventListener('click', () => this.newSession());
+    (this.panel.querySelector('.session-btn') as HTMLButtonElement).addEventListener('click', () => this.toggleSessionDrawer());
+    (this.panel.querySelector('.wf-btn') as HTMLButtonElement).addEventListener('click', () => this.toggleWfDrawer());
+    (this.panel.querySelector('.new-session-btn') as HTMLButtonElement).addEventListener('click', () => this.newSession());
+    this.panel.querySelectorAll('.drawer-close').forEach((b) =>
+      b.addEventListener('click', () => this.closeDrawers())
+    );
 
     this.sendBtn.addEventListener('click', () => this.handleSend());
     this.input.addEventListener('keydown', (e) => {
@@ -461,9 +546,11 @@ export class AgentWidget {
     const loopIntervalMs = parseInt(this.loopInterval.value, 10) || 60000;
 
     try {
+      await this.ensureSession(text);
       const { task, error } = await sendMessage<{ task?: Task; error?: string }>({
         type: 'CREATE_TASK',
         userRequest: text,
+        sessionId: this.currentSessionId ?? undefined,
         kind: isLoop ? 'loop' : 'once',
         loopIntervalMs: isLoop ? loopIntervalMs : undefined,
         loopMaxIterations: isLoop ? 100 : undefined,
@@ -531,8 +618,12 @@ export class AgentWidget {
           this.addAgentMessage(`✅ 任务完成\n${task.result ?? ''}`.trim());
           this.resultRendered = true;
           this.notifyBadge();
+          if (task.recordedSteps?.length && !this.savedWorkflowFor.has(task.id)) {
+            this.renderSaveWorkflow(task);
+          }
         }
         this.stopPolling();
+        void this.refreshSessionsQuietly();
         break;
       case 'failed':
         this.setState('error');
@@ -552,6 +643,288 @@ export class AgentWidget {
     if (['running', 'planning', 'waiting_confirmation'].includes(task.status)) {
       this.startPolling();
     }
+  }
+
+  // ---- Drawers ----
+
+  private closeDrawers(): void {
+    this.sessionDrawer.classList.remove('open');
+    this.wfDrawer.classList.remove('open');
+  }
+
+  // ---- Sessions ----
+
+  private async ensureSession(seed: string): Promise<void> {
+    if (this.currentSessionId) return;
+    try {
+      const title = seed.slice(0, 24) || '新会话';
+      const { session } = await sendMessage<{ session?: ChatSession }>({
+        type: 'CREATE_SESSION',
+        title,
+      });
+      if (session) {
+        this.currentSessionId = session.id;
+        clientLog('info', 'session', `新建会话 ${session.id}`);
+      }
+    } catch {
+      /* task can still run without a session */
+    }
+  }
+
+  private newSession(): void {
+    this.currentSessionId = null;
+    this.currentTask = null;
+    this.resetTaskRenderState();
+    this.savedWorkflowFor.clear();
+    this.messages.innerHTML = '';
+    this.closeDrawers();
+    this.setState('idle');
+    this.addAgentMessage('已开启新会话 ✨\n描述你想完成的任务，我会先制定计划再执行。');
+    if (!this.panel.classList.contains('open')) this.togglePanel();
+  }
+
+  private async toggleSessionDrawer(): Promise<void> {
+    const open = this.sessionDrawer.classList.contains('open');
+    this.wfDrawer.classList.remove('open');
+    if (open) {
+      this.sessionDrawer.classList.remove('open');
+      return;
+    }
+    this.sessionDrawer.classList.add('open');
+    await this.loadSessions();
+  }
+
+  private async loadSessions(): Promise<void> {
+    this.sessionList.innerHTML = '<div class="drawer-empty">加载中…</div>';
+    try {
+      const { sessions } = await sendMessage<{ sessions?: ChatSession[] }>({ type: 'LIST_SESSIONS' });
+      this.sessions = sessions ?? [];
+      this.renderSessions();
+    } catch (err) {
+      this.sessionList.innerHTML = `<div class="drawer-empty">加载失败：${this.escape(String(err))}</div>`;
+    }
+  }
+
+  private renderSessions(): void {
+    if (!this.sessions.length) {
+      this.sessionList.innerHTML = '<div class="drawer-empty">还没有会话。<br>发送一条消息即可开始新会话。</div>';
+      return;
+    }
+    this.sessionList.innerHTML = '';
+    const sorted = [...this.sessions].sort((a, b) => b.updatedAt - a.updatedAt);
+    for (const s of sorted) {
+      const item = document.createElement('div');
+      item.className = 'list-item' + (s.id === this.currentSessionId ? ' active' : '');
+      const date = new Date(s.updatedAt).toLocaleString();
+      item.innerHTML = `
+        <div class="li-main">
+          <div class="li-title"></div>
+          <div class="li-sub">${s.taskIds.length} 个任务 · ${date}</div>
+        </div>
+        <div class="li-act">
+          <button class="li-rename" title="重命名">✎</button>
+          <button class="li-del" title="删除">🗑</button>
+        </div>`;
+      (item.querySelector('.li-title') as HTMLElement).textContent = s.title || '未命名会话';
+      (item.querySelector('.li-main') as HTMLElement).addEventListener('click', () => this.selectSession(s.id));
+      (item.querySelector('.li-rename') as HTMLButtonElement).addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.renameSession(s);
+      });
+      (item.querySelector('.li-del') as HTMLButtonElement).addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.deleteSession(s);
+      });
+      this.sessionList.appendChild(item);
+    }
+  }
+
+  private async selectSession(id: string): Promise<void> {
+    try {
+      const { session, tasks } = await sendMessage<{ session?: ChatSession; tasks?: Task[] }>({
+        type: 'GET_SESSION',
+        sessionId: id,
+      });
+      if (!session) return;
+      this.currentSessionId = id;
+      this.currentTask = null;
+      this.resetTaskRenderState();
+      this.savedWorkflowFor.clear();
+      this.messages.innerHTML = '';
+      this.addSystemMessage(`会话：${session.title}`);
+      const history = tasks ?? [];
+      for (const t of history) {
+        this.addUserMessage(t.userRequest);
+        if (t.status === 'completed' && t.result) {
+          this.addAgentMessage(`✅ ${t.result}`);
+        } else if (t.status === 'failed') {
+          this.addAgentMessage(`任务失败：${t.error ?? '未知错误'}`);
+        }
+      }
+      this.closeDrawers();
+      if (!this.panel.classList.contains('open')) this.togglePanel();
+      const live = history.find((t) =>
+        ['running', 'planning', 'waiting_confirmation'].includes(t.status)
+      );
+      if (live) this.onTaskUpdate(live);
+      clientLog('info', 'session', `切换到会话 ${id}`);
+    } catch (err) {
+      this.addSystemMessage(`加载会话失败：${String(err)}`);
+    }
+  }
+
+  private async renameSession(s: ChatSession): Promise<void> {
+    const title = window.prompt('重命名会话', s.title);
+    if (!title || title === s.title) return;
+    try {
+      await sendMessage({ type: 'RENAME_SESSION', sessionId: s.id, title });
+      await this.loadSessions();
+    } catch (err) {
+      this.addSystemMessage(`重命名失败：${String(err)}`);
+    }
+  }
+
+  private async deleteSession(s: ChatSession): Promise<void> {
+    if (!window.confirm(`删除会话「${s.title}」？此操作不可撤销。`)) return;
+    try {
+      await sendMessage({ type: 'DELETE_SESSION', sessionId: s.id });
+      if (this.currentSessionId === s.id) this.currentSessionId = null;
+      await this.loadSessions();
+    } catch (err) {
+      this.addSystemMessage(`删除失败：${String(err)}`);
+    }
+  }
+
+  private async refreshSessionsQuietly(): Promise<void> {
+    if (!this.sessionDrawer.classList.contains('open')) return;
+    await this.loadSessions();
+  }
+
+  // ---- Workflows ----
+
+  private async toggleWfDrawer(): Promise<void> {
+    const open = this.wfDrawer.classList.contains('open');
+    this.sessionDrawer.classList.remove('open');
+    if (open) {
+      this.wfDrawer.classList.remove('open');
+      return;
+    }
+    this.wfDrawer.classList.add('open');
+    await this.loadWorkflows();
+  }
+
+  private async loadWorkflows(): Promise<void> {
+    this.wfList.innerHTML = '<div class="drawer-empty">加载中…</div>';
+    try {
+      const { workflows } = await sendMessage<{ workflows?: Workflow[] }>({ type: 'LIST_WORKFLOWS' });
+      this.renderWorkflows(workflows ?? []);
+    } catch (err) {
+      this.wfList.innerHTML = `<div class="drawer-empty">加载失败：${this.escape(String(err))}</div>`;
+    }
+  }
+
+  private renderWorkflows(workflows: Workflow[]): void {
+    if (!workflows.length) {
+      this.wfList.innerHTML =
+        '<div class="drawer-empty">还没有工作流。<br>完成一个任务后可保存为工作流，方便重复执行。</div>';
+      return;
+    }
+    this.wfList.innerHTML = '';
+    const triggerLabel: Record<string, string> = {
+      manual: '手动',
+      scheduled: '循环',
+      onPageOpen: '页面加载',
+    };
+    for (const wf of workflows) {
+      const item = document.createElement('div');
+      item.className = 'list-item';
+      const triggers =
+        wf.triggers.map((t) => triggerLabel[t.type] ?? t.type).join('、') || '手动';
+      item.innerHTML = `
+        <div class="li-main">
+          <div class="li-title"></div>
+          <div class="li-sub">${wf.steps.length} 步 · ${triggers}</div>
+        </div>
+        <div class="li-act">
+          <button class="li-run" title="执行">▶</button>
+          <button class="li-del" title="删除">🗑</button>
+        </div>`;
+      (item.querySelector('.li-title') as HTMLElement).textContent = wf.name;
+      (item.querySelector('.li-run') as HTMLButtonElement).addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.runWorkflow(wf);
+      });
+      (item.querySelector('.li-del') as HTMLButtonElement).addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.deleteWorkflow(wf);
+      });
+      this.wfList.appendChild(item);
+    }
+  }
+
+  private async runWorkflow(wf: Workflow): Promise<void> {
+    const params: Record<string, string> = {};
+    for (const p of wf.params ?? []) {
+      const v = window.prompt(`参数：${p.label || p.key}`, p.default ?? '');
+      params[p.key] = v ?? p.default ?? '';
+    }
+    this.closeDrawers();
+    if (!this.panel.classList.contains('open')) this.togglePanel();
+    this.addSystemMessage(`▶ 执行工作流：${wf.name}`);
+    clientLog('info', 'workflow', `执行工作流 ${wf.name}`, { id: wf.id });
+    try {
+      const { task, error } = await sendMessage<{ task?: Task; error?: string }>({
+        type: 'RUN_WORKFLOW',
+        workflowId: wf.id,
+        params,
+      });
+      if (error) throw new Error(error);
+      if (task) {
+        this.resetTaskRenderState();
+        this.onTaskUpdate(task);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.addAgentMessage(`工作流执行失败：${msg}`);
+    }
+  }
+
+  private async deleteWorkflow(wf: Workflow): Promise<void> {
+    if (!window.confirm(`删除工作流「${wf.name}」？`)) return;
+    try {
+      await sendMessage({ type: 'DELETE_WORKFLOW', workflowId: wf.id });
+      await this.loadWorkflows();
+    } catch (err) {
+      this.addSystemMessage(`删除失败：${String(err)}`);
+    }
+  }
+
+  private renderSaveWorkflow(task: Task): void {
+    const el = document.createElement('div');
+    el.className = 'msg agent';
+    el.innerHTML = `<div class="bubble text">💾 将本次操作保存为工作流，便于重复执行？<div class="inline-actions"><button class="btn-go save-wf">保存为工作流</button></div></div>`;
+    const btn = el.querySelector('.save-wf') as HTMLButtonElement;
+    btn.addEventListener('click', async () => {
+      const name = window.prompt('工作流名称', task.userRequest.slice(0, 24));
+      if (!name) return;
+      btn.disabled = true;
+      try {
+        await sendMessage({
+          type: 'SAVE_AS_WORKFLOW',
+          taskId: task.id,
+          name,
+          description: task.userRequest,
+          triggers: [{ type: 'manual' }],
+        });
+        this.savedWorkflowFor.add(task.id);
+        this.addSystemMessage(`已保存工作流：${name}`);
+      } catch (err) {
+        btn.disabled = false;
+        this.addSystemMessage(`保存失败：${String(err)}`);
+      }
+    });
+    this.messages.appendChild(el);
+    this.scrollToBottom();
   }
 
   private notifyBadge(): void {

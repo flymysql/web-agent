@@ -6,8 +6,10 @@ import type {
   PageContext,
 } from '@ai-browser-agent/shared';
 import { JsonRepository } from '../persistence/json-repository.js';
+import { debugLog } from '../debug/logger.js';
 
-const tasks = new JsonRepository<Task>('tasks');
+const tasks = new JsonRepository<Task>('tasks', undefined, { maxItems: 500 });
+const MAX_LOGS_PER_TASK = 500;
 
 function createLog(level: TaskLogEntry['level'], message: string, data?: Record<string, unknown>): TaskLogEntry {
   return {
@@ -21,6 +23,7 @@ function createLog(level: TaskLogEntry['level'], message: string, data?: Record<
 
 export function createTask(input: {
   userRequest: string;
+  sessionId?: string;
   tabId?: number;
   url?: string;
   kind?: 'once' | 'loop';
@@ -33,6 +36,7 @@ export function createTask(input: {
   const now = Date.now();
   const task: Task = {
     id: uuidv4(),
+    sessionId: input.sessionId,
     userRequest: input.userRequest,
     status: 'pending',
     kind: input.kind ?? 'once',
@@ -52,6 +56,10 @@ export function createTask(input: {
   };
   tasks.upsert(task);
   return task;
+}
+
+export function deleteTask(id: string): void {
+  tasks.delete(id);
 }
 
 export function getTask(id: string): Task | undefined {
@@ -78,9 +86,10 @@ export function addLog(
 ): Task {
   const task = getTask(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
-  return updateTask(taskId, {
-    logs: [...task.logs, createLog(level, message, data)],
-  });
+  const logs = [...task.logs, createLog(level, message, data)];
+  const trimmed = logs.length > MAX_LOGS_PER_TASK ? logs.slice(-MAX_LOGS_PER_TASK) : logs;
+  debugLog({ source: 'task', level, category: 'flow', message, taskId, data });
+  return updateTask(taskId, { logs: trimmed });
 }
 
 export function saveCheckpoint(taskId: string, checkpoint: Omit<TaskCheckpoint, 'savedAt'>): Task {

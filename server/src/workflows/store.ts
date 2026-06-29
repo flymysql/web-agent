@@ -46,5 +46,7 @@ export function deleteWorkflow(id: string): void {
 }
 
 export function getWorkflowsByTrigger(type: Workflow['triggers'][number]['type']): Workflow[] {
-  return workflows.list().filter((w) => w.triggers.some((t) => t.type === type));
+  return workflows
+    .list()
+    .filter((w) => w.triggers.some((t: Workflow['triggers'][number]) => t.type === type));
 }

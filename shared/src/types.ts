@@ -124,6 +124,7 @@ export type TaskMode = 'agent' | 'replay';
 
 export interface Task {
   id: string;
+  sessionId?: string;
   userRequest: string;
   status: TaskStatus;
   kind: TaskKind;
@@ -150,6 +151,15 @@ export interface Task {
     args: Record<string, unknown>;
     reason: string;
   };
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** A chat session / conversation grouping multiple tasks with shared context */
+export interface ChatSession {
+  id: string;
+  title: string;
+  taskIds: string[];
   createdAt: number;
   updatedAt: number;
 }
