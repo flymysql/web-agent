@@ -45,6 +45,8 @@ export type WsMessageType =
   | 'task.update'
   | 'task.confirm'
   | 'task.reject'
+  | 'task.steer'
+  | 'agent.event'
   | 'tool.execute'
   | 'tool.result'
   | 'page.context'
@@ -86,6 +88,18 @@ export interface TaskCreatedPayload {
 
 export interface TaskUpdatePayload {
   task: Task;
+}
+
+export interface AgentEventPayload {
+  taskId: string;
+  tabId?: number;
+  kind: 'delta' | 'done';
+  text?: string;
+}
+
+export interface TaskSteerPayload {
+  taskId: string;
+  text: string;
 }
 
 export interface ToolExecutePayload {

@@ -24,6 +24,58 @@ function isClickable(el: Element): boolean {
   return !disabled && !ariaDisabled;
 }
 
+/**
+ * Cheap page-wide fingerprint: URL + element count + visible-text length.
+ * Any real effect of a click (navigation, content swap, dropdown injecting
+ * nodes, etc.) shifts at least one of these.
+ */
+function globalDigest(): string {
+  return [
+    location.href,
+    document.getElementsByTagName('*').length,
+    (document.body?.innerText ?? '').length,
+  ].join('|');
+}
+
+/**
+ * Signature of the clicked element itself, to catch in-place toggles
+ * (checkbox/radio, aria-expanded/pressed/selected, value, class) that may not
+ * move the page-wide digest.
+ */
+function elementSig(el: Element | null): string {
+  if (!el || !el.isConnected) return 'gone';
+  const input = el as HTMLInputElement;
+  return [
+    el.className,
+    el.getAttribute('aria-expanded') ?? '',
+    el.getAttribute('aria-pressed') ?? '',
+    el.getAttribute('aria-selected') ?? '',
+    typeof input.checked === 'boolean' ? String(input.checked) : '',
+    input.value ?? '',
+  ].join('|');
+}
+
+/** Poll briefly after a click for any observable effect on the page or target. */
+async function waitForClickEffect(
+  beforeGlobal: string,
+  beforeEl: string,
+  el: Element,
+  timeoutMs: number
+): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    await sleep(150);
+    try {
+      if (globalDigest() !== beforeGlobal) return true;
+      if (elementSig(el) !== beforeEl) return true;
+    } catch {
+      // Document is being torn down → a navigation is in progress → counts as a change.
+      return true;
+    }
+  }
+  return false;
+}
+
 /** Tolerant lookup: accepts el-N ids and pierces shadow roots. */
 function findEl(selector: string): Element | null {
   try {
@@ -110,8 +162,21 @@ export async function executeBrowserTool(
         const el = resolveSelector(selector) as HTMLElement;
         el.scrollIntoView({ block: 'center', behavior: 'instant' });
         el.focus();
+        const beforeGlobal = globalDigest();
+        const beforeEl = elementSig(el);
         el.click();
-        await sleep(300);
+        // Wait for the page to settle, watching for navigation or any DOM change.
+        const changed = await waitForClickEffect(beforeGlobal, beforeEl, el, 1200);
+        if (!changed) {
+          // The click resolved but produced no observable effect — almost always a
+          // dead/JS-routed link or the wrong element. Report a soft failure so the
+          // agent stops re-clicking the same target and tries another approach.
+          return {
+            success: false,
+            error: `点击 "${selector}" 没有产生任何可见效果（页面未跳转、DOM 未变化）。该目标很可能是无效链接或不是真正的可点击元素。请换一个选择器、点击它所在的整行/父元素，或改用其它方式（如 evaluate）触发。`,
+            result: { clicked: selector, noOp: true },
+          };
+        }
         return { success: true, result: { clicked: selector } };
       }
 
@@ -281,11 +346,30 @@ export async function executeBrowserTool(
       case 'injectCSS': {
         const css = args.css as string;
         if (!css) return { success: false, error: 'css is required' };
+        const id = (args.id as string | undefined)?.trim();
+        // Re-injecting with the same id replaces the previous block so themes
+        // don't pile up into an un-undoable mess.
+        if (id) {
+          document
+            .querySelectorAll(`style[data-agent-injected][data-agent-css-id="${CSS.escape(id)}"]`)
+            .forEach((el) => el.remove());
+        }
         const style = document.createElement('style');
         style.setAttribute('data-agent-injected', 'true');
+        if (id) style.setAttribute('data-agent-css-id', id);
         style.textContent = css;
         (document.head ?? document.documentElement).appendChild(style);
-        return { success: true, result: { injected: css.length } };
+        return { success: true, result: { injected: css.length, id: id ?? null } };
+      }
+
+      case 'clearInjectedCSS': {
+        const id = (args.id as string | undefined)?.trim();
+        const selector = id
+          ? `style[data-agent-injected][data-agent-css-id="${CSS.escape(id)}"]`
+          : 'style[data-agent-injected]';
+        const nodes = document.querySelectorAll(selector);
+        nodes.forEach((el) => el.remove());
+        return { success: true, result: { removed: nodes.length, id: id ?? null } };
       }
 
       case 'expect': {

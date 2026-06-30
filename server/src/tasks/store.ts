@@ -4,6 +4,7 @@ import type {
   TaskLogEntry,
   TaskCheckpoint,
   PageContext,
+  RequestMode,
 } from '@ai-browser-agent/shared';
 import { JsonRepository } from '../persistence/json-repository.js';
 import { debugLog } from '../debug/logger.js';
@@ -27,7 +28,8 @@ export function createTask(input: {
   tabId?: number;
   url?: string;
   kind?: 'once' | 'loop';
-  mode?: 'agent' | 'replay';
+  mode?: 'agent' | 'replay' | 'chat';
+  requestMode?: RequestMode;
   maxSteps?: number;
   loopIntervalMs?: number;
   loopMaxIterations?: number;
@@ -41,6 +43,7 @@ export function createTask(input: {
     status: 'pending',
     kind: input.kind ?? 'once',
     mode: input.mode ?? 'agent',
+    requestMode: input.requestMode ?? 'auto',
     maxSteps: input.maxSteps,
     workflowId: input.workflowId,
     tabId: input.tabId,

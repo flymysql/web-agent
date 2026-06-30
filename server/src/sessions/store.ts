@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
-import type { ChatSession, Task } from '@ai-browser-agent/shared';
+import type { ChatSession, ChatMessage, Task } from '@ai-browser-agent/shared';
 import { JsonRepository } from '../persistence/json-repository.js';
 import { getTask } from '../tasks/store.js';
 
@@ -63,6 +63,52 @@ export function addTaskToSession(sessionId: string, taskId: string, request?: st
   return sessions.upsert({ ...session, taskIds, title, updatedAt: Date.now() });
 }
 
+/** Append a user turn to the conversation thread (no-op without a session). */
+export function appendUserMessage(
+  sessionId: string | undefined,
+  taskId: string,
+  content: string
+): void {
+  if (!sessionId) return;
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  const messages = [...(session.messages ?? [])];
+  messages.push({ id: uuidv4(), role: 'user', kind: 'text', content, taskId, createdAt: Date.now() });
+  sessions.upsert({ ...session, messages, updatedAt: Date.now() });
+}
+
+/**
+ * Record (or update) the assistant turn for a task once it reaches a
+ * user-facing state: a chat answer, a clarifying question, a final result, or a
+ * failure. Idempotent per task so repeated calls during a run don't duplicate.
+ */
+export function recordAssistantTurn(task: Task): void {
+  if (!task.sessionId) return;
+  const session = sessions.get(task.sessionId);
+  if (!session) return;
+
+  let content: string | undefined;
+  if (task.status === 'needs_input') content = task.clarifyQuestion ?? task.assistantMessage;
+  else if (task.status === 'completed') content = task.assistantMessage ?? task.result;
+  else if (task.status === 'failed') content = `任务失败：${task.error ?? '未知错误'}`;
+  else return;
+  if (!content) return;
+
+  const messages = [...(session.messages ?? [])];
+  const idx = messages.findIndex((m) => m.taskId === task.id && m.role === 'assistant');
+  const message: ChatMessage = {
+    id: idx >= 0 ? messages[idx].id : uuidv4(),
+    role: 'assistant',
+    kind: task.mode === 'chat' ? 'text' : 'run',
+    content,
+    taskId: task.id,
+    createdAt: idx >= 0 ? messages[idx].createdAt : Date.now(),
+  };
+  if (idx >= 0) messages[idx] = message;
+  else messages.push(message);
+  sessions.upsert({ ...session, messages, updatedAt: Date.now() });
+}
+
 export function getSessionTasks(id: string): Task[] {
   const session = sessions.get(id);
   if (!session) return [];
@@ -85,6 +131,15 @@ export function buildConversationContext(
   if (!sessionId) return '';
   const session = sessions.get(sessionId);
   if (!session) return '';
+
+  // Preferred: the real message thread (multi-turn memory for follow-ups).
+  const msgs = (session.messages ?? []).filter((m) => m.taskId !== excludeTaskId);
+  if (msgs.length > 0) {
+    const recent = msgs.slice(-maxTasks * 2);
+    return recent
+      .map((m) => `${m.role === 'user' ? '用户' : '助手'}: ${String(m.content).slice(0, 200)}`)
+      .join('\n');
+  }
 
   const prior = session.taskIds
     .filter((id) => id !== excludeTaskId)

@@ -5,10 +5,15 @@ import type {
   Workflow,
   ChatSession,
 } from '@ai-browser-agent/shared';
+import { extractPageContext } from './page-context.js';
 
 type AgentState = 'idle' | 'thinking' | 'working' | 'happy' | 'error' | 'waiting';
 
 const BALL_POS_KEY = 'agent_ball_pos';
+// Whether the user has explicitly minimized the panel. Persisted so the panel
+// stays open across task-driven navigations (the content script reloads each
+// time) unless the user chose to collapse it.
+const PANEL_MIN_KEY = 'agent_panel_minimized';
 
 function sendMessage<T>(message: object): Promise<T> {
   return chrome.runtime.sendMessage(message) as Promise<T>;
@@ -35,6 +40,20 @@ function clientLog(
 }
 
 /** Robot mascot as inline SVG. Expression driven by state. */
+function sparkSvg(): string {
+  return `<svg viewBox="0 0 24 24" width="15" height="15" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <path d="M12 2l1.7 6.3L20 10l-6.3 1.7L12 18l-1.7-6.3L4 10l6.3-1.7z" fill="#fff"/>
+    <circle cx="19" cy="5" r="1.4" fill="#fff" opacity="0.85"/>
+  </svg>`;
+}
+
+function refreshSvg(): string {
+  return `<svg viewBox="0 0 24 24" width="14" height="14" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <path d="M20 11a8 8 0 1 0-.5 3.5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+    <path d="M20 4v5h-5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
+}
+
 function mascotSvg(): string {
   return `
   <svg class="mascot" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
@@ -79,6 +98,133 @@ const STYLES = `
 }
 .ball:hover { transform: scale(1.08); box-shadow: 0 8px 26px rgba(79,70,229,0.6); }
 .ball.dragging { cursor: grabbing; transition: none; }
+
+/* Page-aware suggestion pills floating next to the ball (teaser when collapsed) */
+.suggest-bar {
+  position: fixed;
+  z-index: 2147483645;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+.suggest-bar.flip { align-items: flex-start; }
+.suggest-bar.hidden { display: none; }
+.suggest-pill {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 300px;
+  padding: 10px 16px;
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.25;
+  text-align: left;
+  background: linear-gradient(100deg, #7c83ff 0%, #8b7cf6 42%, #56c8b2 100%);
+  box-shadow: 0 6px 18px rgba(99,102,241,0.38);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: transform 0.12s ease, box-shadow 0.2s ease, opacity 0.2s ease;
+  animation: pillIn 0.26s cubic-bezier(0.2,0.8,0.2,1) both;
+}
+.suggest-pill .spark { flex: 0 0 auto; display: inline-flex; }
+.suggest-pill .pill-text { overflow: hidden; text-overflow: ellipsis; }
+.suggest-pill:hover { transform: translateX(-3px) scale(1.03); box-shadow: 0 9px 24px rgba(99,102,241,0.55); }
+.suggest-bar.flip .suggest-pill:hover { transform: translateX(3px) scale(1.03); }
+.suggest-pill.refresh {
+  background: rgba(255,255,255,0.92);
+  color: #6366f1;
+  font-weight: 600;
+  padding: 7px 14px;
+  box-shadow: 0 4px 14px rgba(17,24,39,0.16);
+  border: 1px solid rgba(99,102,241,0.25);
+}
+.suggest-pill.refresh:hover { box-shadow: 0 7px 18px rgba(17,24,39,0.22); }
+.suggest-pill.refresh .spark { color: #6366f1; }
+.suggest-pill.refresh.spin .spark { animation: refreshSpin 0.6s linear; }
+@keyframes refreshSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+@keyframes pillIn { from { opacity: 0; transform: translateX(14px); } to { opacity: 1; transform: translateX(0); } }
+.suggest-bar.flip .suggest-pill { animation-name: pillInFlip; }
+@keyframes pillInFlip { from { opacity: 0; transform: translateX(-14px); } to { opacity: 1; transform: translateX(0); } }
+
+/* Centered result overlay: present substantial output in a rich, readable card */
+.result-modal { position: fixed; inset: 0; z-index: 2147483647; display: none; }
+.result-modal.open { display: block; }
+.rm-backdrop { position: absolute; inset: 0; background: rgba(15,17,33,0.55); backdrop-filter: blur(3px); animation: rmFade 0.2s ease; }
+.rm-card {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+  width: min(760px, 92vw); max-height: 86vh; display: flex; flex-direction: column;
+  background: #fff; border-radius: 16px; overflow: hidden;
+  box-shadow: 0 24px 70px rgba(0,0,0,0.42); animation: rmPop 0.24s cubic-bezier(0.2,0.8,0.2,1);
+}
+.rm-head {
+  display: flex; align-items: center; gap: 10px; padding: 14px 16px; color: #fff;
+  background: linear-gradient(100deg,#6366f1,#8b5cf6 55%,#22b8a6);
+}
+.rm-spark { display: inline-flex; flex: 0 0 auto; }
+.rm-title { flex: 1; font-size: 15px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rm-copy-all, .rm-close { border: none; background: rgba(255,255,255,0.18); color: #fff; cursor: pointer; border-radius: 8px; font-size: 13px; }
+.rm-copy-all { padding: 5px 10px; }
+.rm-close { font-size: 18px; line-height: 1; padding: 3px 9px; }
+.rm-copy-all:hover, .rm-close:hover { background: rgba(255,255,255,0.34); }
+.rm-body { padding: 18px 20px; overflow: auto; color: #1f2433; font-size: 14px; line-height: 1.62; }
+.rm-h { margin: 16px 0 8px; font-weight: 700; line-height: 1.3; }
+.rm-h:first-child { margin-top: 0; }
+h1.rm-h { font-size: 20px; } h2.rm-h { font-size: 18px; } h3.rm-h { font-size: 16px; } h4.rm-h { font-size: 15px; }
+.rm-p { margin: 8px 0; }
+.rm-ul, .rm-ol { margin: 8px 0; padding-left: 22px; }
+.rm-ul li, .rm-ol li { margin: 4px 0; }
+.rm-code { margin: 12px 0; border-radius: 10px; overflow: hidden; }
+.rm-code-head { display: flex; justify-content: space-between; align-items: center; padding: 6px 12px; background: #1b1f2e; color: #9aa4c0; font-size: 12px; }
+.rm-code-head .rm-copy { border: none; background: #2a3146; color: #cdd6f4; border-radius: 6px; padding: 3px 9px; cursor: pointer; font-size: 12px; }
+.rm-code-head .rm-copy:hover { background: #3a4366; }
+.rm-code pre { margin: 0; padding: 12px 14px; overflow: auto; background: #0f1117; color: #e6e9f5; font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size: 12.5px; line-height: 1.55; white-space: pre; }
+.rm-table-wrap { overflow: auto; margin: 12px 0; }
+.rm-table { border-collapse: collapse; width: 100%; font-size: 13px; }
+.rm-table th, .rm-table td { border: 1px solid #e5e7f0; padding: 7px 10px; text-align: left; }
+.rm-table th { background: #f3f4fb; font-weight: 700; }
+.rm-body a { color: #4f46e5; word-break: break-all; }
+.rm-badge { flex: 0 0 auto; font-size: 12px; font-weight: 600; background: rgba(255,255,255,0.22); color: #fff; padding: 3px 9px; border-radius: 999px; white-space: nowrap; }
+.rm-actions { display: flex; gap: 6px; }
+.rm-act-btn { border: none; background: rgba(255,255,255,0.18); color: #fff; cursor: pointer; border-radius: 8px; padding: 5px 10px; font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+.rm-act-btn:hover { background: rgba(255,255,255,0.34); }
+
+/* links template */
+.rm-links { display: flex; flex-direction: column; gap: 8px; }
+.rm-link { display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; border: 1px solid #e5e7f0; border-radius: 10px; text-decoration: none; transition: border-color 0.15s, background 0.15s; }
+.rm-link:hover { border-color: #a5b4fc; background: #f5f6ff; }
+.rm-link-t { color: #1f2433; font-weight: 600; font-size: 13.5px; word-break: break-word; }
+.rm-link-u { color: #6b7280; font-size: 12px; word-break: break-all; }
+
+/* key-value / facts template */
+.rm-kv { display: grid; grid-template-columns: max-content 1fr; gap: 0; margin: 0; border: 1px solid #e5e7f0; border-radius: 10px; overflow: hidden; }
+.rm-kv-row { display: contents; }
+.rm-kv dt { background: #f6f7fc; color: #4338ca; font-weight: 600; padding: 9px 12px; border-bottom: 1px solid #eceef6; }
+.rm-kv dd { margin: 0; padding: 9px 12px; border-bottom: 1px solid #eceef6; color: #1f2433; word-break: break-word; }
+.rm-kv .rm-kv-row:last-child dt, .rm-kv .rm-kv-row:last-child dd { border-bottom: none; }
+
+/* checklist / cards template */
+.rm-cards { display: flex; flex-direction: column; gap: 8px; }
+.rm-card-item { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; background: #f7f8fd; border: 1px solid #eceef6; border-radius: 10px; font-size: 13.5px; line-height: 1.5; }
+.rm-card-item .rm-dot { flex: 0 0 auto; width: 7px; height: 7px; margin-top: 6px; border-radius: 50%; background: linear-gradient(135deg,#6366f1,#22b8a6); }
+
+@keyframes rmFade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes rmPop { from { opacity: 0; transform: translate(-50%,-46%) scale(0.96); } to { opacity: 1; transform: translate(-50%,-50%) scale(1); } }
+
+/* Compact result card shown inside chat with a button to open the overlay */
+.res-card { display: flex; flex-direction: column; gap: 8px; }
+.res-card-row { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.res-preview { color: #6b7280; font-size: 12.5px; line-height: 1.5; max-height: 58px; overflow: hidden; }
+.btn-view { align-self: flex-start; border: none; border-radius: 8px; cursor: pointer; padding: 6px 14px; font-size: 12.5px; font-weight: 600; color: #fff; background: linear-gradient(100deg,#6366f1,#8b5cf6 60%,#22b8a6); }
+.btn-view:hover { filter: brightness(1.06); }
 
 .mascot { width: 46px; height: 46px; animation: bob 2.6s ease-in-out infinite; }
 @keyframes bob { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-3px); } }
@@ -207,6 +353,17 @@ const STYLES = `
 .composer .send:hover { background: #4338ca; }
 .composer .send:disabled { background: #c7d2fe; cursor: not-allowed; }
 .composer .opts { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 11px; color: #6b7280; }
+.composer .opts .mode-select {
+  font-size: 11px; padding: 2px 4px; border: 1px solid #d1d5db; border-radius: 5px;
+  background: #fff; color: #374151; cursor: pointer; font-family: inherit;
+}
+.composer .opts .mode-select:focus { outline: none; border-color: #a5b4fc; }
+.msg.agent .bubble .md-code { background: #eef2ff; color: #3730a3; padding: 1px 4px; border-radius: 4px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+.msg.agent .bubble .md-pre { background: #1e293b; color: #e2e8f0; padding: 8px 10px; border-radius: 6px; overflow-x: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; margin: 6px 0; white-space: pre-wrap; }
+.msg.agent .bubble a { color: #4f46e5; text-decoration: underline; }
+.inline-actions .btn-continue { background: #4f46e5; color: #fff; border: none; border-radius: 6px; padding: 4px 12px; cursor: pointer; font-size: 12px; }
+.inline-actions .btn-retry { background: #fff; color: #4f46e5; border: 1px solid #c7d2fe; border-radius: 6px; padding: 4px 12px; cursor: pointer; font-size: 12px; }
+.plan-step.done { color: #16a34a; text-decoration: line-through; opacity: 0.75; }
 .composer .opts input[type="number"] { width: 78px; padding: 2px 6px; border: 1px solid #d1d5db; border-radius: 5px; font-size: 11px; }
 .composer .opts input[type="number"]:disabled { opacity: 0.5; }
 
@@ -237,15 +394,6 @@ const STYLES = `
 .list-item .li-act { display: flex; gap: 2px; flex-shrink: 0; }
 .list-item .li-act button { background: none; border: none; cursor: pointer; font-size: 13px; padding: 3px 5px; border-radius: 5px; color: #6b7280; }
 .list-item .li-act button:hover { background: #e5e7eb; }
-
-/* Page-open suggestions */
-.suggestions { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
-.suggest-chip {
-  text-align: left; padding: 7px 10px; border: 1px solid #d6dbf5; border-radius: 8px;
-  background: #f0f2ff; color: #3730a3; cursor: pointer; font-size: 12.5px; line-height: 1.35;
-  font-family: inherit;
-}
-.suggest-chip:hover { background: #e0e4ff; border-color: #a5b4fc; }
 `;
 
 export class AgentWidget {
@@ -257,6 +405,7 @@ export class AgentWidget {
   private sendBtn!: HTMLButtonElement;
   private statusDot!: HTMLDivElement;
   private badge!: HTMLDivElement;
+  private modeSelect!: HTMLSelectElement;
   private loopChk!: HTMLInputElement;
   private loopInterval!: HTMLInputElement;
   private sessionDrawer!: HTMLDivElement;
@@ -269,8 +418,22 @@ export class AgentWidget {
   private sessions: ChatSession[] = [];
   private savedWorkflowFor = new Set<string>();
   private currentTask: Task | null = null;
+  private streamBubbles = new Map<string, HTMLElement>();
+  private suggestBar!: HTMLDivElement;
+  private resultModal!: HTMLDivElement;
+  private resultModalRaw = '';
+  private userMinimized = false;
+  // Rotating pool of "what can I do here" suggestions + the current 3-wide window
+  // offset, so the user can cycle through batches with the 换一批 control.
+  private suggestPool: Array<{ label: string; prompt: string }> = [];
+  private suggestOffset = 0;
+  // Set when the user manually (re)loaded a page that still has a live task bound
+  // to it: keep the panel minimized + suggestions until the user opens it, even as
+  // live task updates keep streaming in.
+  private autoOpenSuppressed = false;
   private renderedLogIds = new Set<string>();
   private planRenderedFor: string | null = null;
+  private planEl: HTMLElement | null = null;
   private resultRendered = false;
   private confirmRenderedStep: string | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -301,6 +464,41 @@ export class AgentWidget {
     this.ball = ball;
     this.badge = ball.querySelector('.badge') as HTMLDivElement;
 
+    const suggestBar = document.createElement('div');
+    suggestBar.className = 'suggest-bar hidden';
+    this.root.appendChild(suggestBar);
+    this.suggestBar = suggestBar;
+
+    const modal = document.createElement('div');
+    modal.className = 'result-modal';
+    modal.innerHTML = `
+      <div class="rm-backdrop"></div>
+      <div class="rm-card">
+        <div class="rm-head">
+          <span class="rm-spark">${sparkSvg()}</span>
+          <div class="rm-title">任务结果</div>
+          <span class="rm-badge"></span>
+          <div class="rm-actions"></div>
+          <button class="rm-copy-all" title="复制全部">⧉ 复制</button>
+          <button class="rm-close" title="关闭">×</button>
+        </div>
+        <div class="rm-body"></div>
+      </div>`;
+    this.root.appendChild(modal);
+    this.resultModal = modal;
+    (modal.querySelector('.rm-close') as HTMLButtonElement).addEventListener('click', () => this.closeResultModal());
+    (modal.querySelector('.rm-backdrop') as HTMLElement).addEventListener('click', () => this.closeResultModal());
+    (modal.querySelector('.rm-copy-all') as HTMLButtonElement).addEventListener('click', (e) => {
+      const btn = e.currentTarget as HTMLButtonElement;
+      navigator.clipboard
+        ?.writeText(this.resultModalRaw)
+        .then(() => {
+          btn.textContent = '✓ 已复制';
+          setTimeout(() => (btn.textContent = '⧉ 复制'), 1500);
+        })
+        .catch(() => {});
+    });
+
     const panel = document.createElement('div');
     panel.className = 'panel';
     panel.innerHTML = `
@@ -321,7 +519,13 @@ export class AgentWidget {
           <button class="send" title="发送">➤</button>
         </div>
         <div class="opts">
-          <label><input type="checkbox" class="loop-chk"> 循环任务</label>
+          <select class="mode-select" title="交互模式">
+            <option value="auto">⚡ 自动</option>
+            <option value="ask">💬 问答</option>
+            <option value="agent">🤖 执行</option>
+            <option value="plan">📋 仅计划</option>
+          </select>
+          <label><input type="checkbox" class="loop-chk"> 循环</label>
           <input type="number" class="loop-interval" value="60000" min="5000" disabled> ms
         </div>
       </div>
@@ -340,6 +544,7 @@ export class AgentWidget {
     this.input = panel.querySelector('.input') as HTMLTextAreaElement;
     this.sendBtn = panel.querySelector('.send') as HTMLButtonElement;
     this.statusDot = panel.querySelector('.status-dot') as HTMLDivElement;
+    this.modeSelect = panel.querySelector('.mode-select') as HTMLSelectElement;
     this.loopChk = panel.querySelector('.loop-chk') as HTMLInputElement;
     this.loopInterval = panel.querySelector('.loop-interval') as HTMLInputElement;
     this.sessionDrawer = panel.querySelector('.session-drawer') as HTMLDivElement;
@@ -418,6 +623,7 @@ export class AgentWidget {
       this.ball.style.right = 'auto';
       this.ball.style.bottom = 'auto';
       if (this.panel.classList.contains('open')) this.positionPanel();
+      this.positionSuggestBar();
     });
 
     this.ball.addEventListener('pointerup', (e) => {
@@ -433,7 +639,7 @@ export class AgentWidget {
     });
 
     (this.panel.querySelector('.min-btn') as HTMLButtonElement).addEventListener('click', () => {
-      this.panel.classList.remove('open');
+      this.minimizePanel();
     });
 
     (this.panel.querySelector('.new-btn') as HTMLButtonElement).addEventListener('click', () => this.newSession());
@@ -468,14 +674,30 @@ export class AgentWidget {
       if (message.type === 'TASK_UPDATE' && message.task) {
         this.onTaskUpdate(message.task as Task);
       }
+      if (message.type === 'AGENT_EVENT' && message.taskId) {
+        this.onAgentEvent(message.taskId, message.event ?? {});
+      }
     });
 
     window.addEventListener('resize', () => {
       if (this.panel.classList.contains('open')) this.positionPanel();
+      this.positionSuggestBar();
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && this.resultModal.classList.contains('open')) {
+        this.closeResultModal();
+      }
     });
   }
 
   private async init(): Promise<void> {
+    try {
+      const s = await chrome.storage.local.get(PANEL_MIN_KEY);
+      this.userMinimized = !!s[PANEL_MIN_KEY];
+    } catch {
+      /* default to not minimized */
+    }
     try {
       await sendMessage({ type: 'CONNECT_BACKEND' });
       const status = await sendMessage<{ connected: boolean }>({ type: 'GET_BACKEND_STATUS' });
@@ -486,7 +708,7 @@ export class AgentWidget {
     // Resume an in-progress task if the agent is operating this tab; otherwise
     // (a page the user opened themselves) offer contextual operation hints.
     const resumed = await this.reattach();
-    if (!resumed) this.showPageSuggestions();
+    if (!resumed) void this.showPageSuggestions();
   }
 
   /**
@@ -497,14 +719,48 @@ export class AgentWidget {
    */
   private async reattach(): Promise<boolean> {
     try {
-      const { task } = await sendMessage<{ task: Task | null }>({ type: 'GET_ACTIVE_TASK' });
+      const { task, agentDriven } = await sendMessage<{ task: Task | null; agentDriven?: boolean }>({
+        type: 'GET_ACTIVE_TASK',
+      });
       if (!task) return false;
       this.currentSessionId = task.sessionId ?? this.currentSessionId;
       this.resetTaskRenderState();
+
+      // The page navigated and recreated this UI empty. Before resuming the live
+      // task, replay the rest of its session (prior tasks' plans, steps, outcomes)
+      // so earlier conversation history isn't lost on every navigation/refresh.
+      if (task.sessionId) {
+        try {
+          const { tasks } = await sendMessage<{ session?: ChatSession; tasks?: Task[] }>({
+            type: 'GET_SESSION',
+            sessionId: task.sessionId,
+          });
+          const prior = (tasks ?? []).filter((t) => t.id !== task.id);
+          if (prior.length) {
+            this.messages.innerHTML = '';
+            this.suggestBar?.classList.add('hidden');
+            for (const t of prior) this.renderHistoricalTask(t);
+          }
+        } catch {
+          /* backend offline or no session — fall back to just the live task */
+        }
+      }
+
       this.addSystemMessage('↻ 已重新接管进行中的任务');
       this.onTaskUpdate(task);
       this.notifyBadge();
-      clientLog('info', 'task', '导航后重新接管任务', { status: task.status }, task.id);
+      if (agentDriven && !this.userMinimized) {
+        // The agent itself navigated here as part of the task → keep panel open.
+        this.openPanel();
+      } else if (!agentDriven) {
+        // The USER manually refreshed / opened this page (a task just happens to
+        // still be bound to the tab). Stay minimized and surface suggestions, and
+        // suppress auto-open so live task updates don't pop the panel back open.
+        this.autoOpenSuppressed = true;
+        this.panel.classList.remove('open');
+        void this.showPageSuggestions();
+      }
+      clientLog('info', 'task', '导航后重新接管任务', { status: task.status, agentDriven }, task.id);
       return true;
     } catch {
       return false; // no active task or backend offline
@@ -515,11 +771,78 @@ export class AgentWidget {
    * On a freshly opened page (by the user, not the agent), show 2-3 context-aware
    * hints about what the agent can do here, to help users discover capabilities.
    */
-  private showPageSuggestions(): void {
-    const suggestions = this.buildSuggestions();
-    if (!suggestions.length) return;
-    this.renderSuggestions(suggestions);
-    if (!this.panel.classList.contains('open')) this.togglePanel();
+  private async showPageSuggestions(): Promise<void> {
+    // Show fast local heuristics immediately as pills next to the ball, then
+    // upgrade them in place with page-aware suggestions from the model. The
+    // pills are an unobtrusive teaser — they do NOT auto-open the chat panel.
+    this.suggestPool = this.dedupeSuggestions(this.buildSuggestions());
+    this.suggestOffset = 0;
+    if (this.suggestPool.length) this.renderSuggestionWindow();
+
+    if (!this.connected) return;
+    try {
+      const pageContext = extractPageContext();
+      const { suggestions } = await sendMessage<{
+        suggestions?: Array<{ label: string; prompt: string }>;
+      }>({ type: 'SUGGEST_ACTIONS', pageContext });
+      const list = (suggestions ?? []).filter((s) => s?.label && s?.prompt);
+      if (list.length) {
+        // Model suggestions are the most relevant → show them first, keep the
+        // heuristic ones as extra batches the user can cycle to with 换一批.
+        this.suggestPool = this.dedupeSuggestions([...list, ...this.suggestPool]);
+        this.suggestOffset = 0;
+        this.renderSuggestionWindow();
+      }
+    } catch {
+      /* offline or model error — the heuristic pills already shown stand */
+    }
+  }
+
+  private dedupeSuggestions(
+    items: Array<{ label: string; prompt: string }>
+  ): Array<{ label: string; prompt: string }> {
+    const seen = new Set<string>();
+    return items.filter((s) => (s?.label && !seen.has(s.label) ? seen.add(s.label) : false));
+  }
+
+  /** Render the current 3-wide window of the suggestion pool (plus 换一批). */
+  private renderSuggestionWindow(): void {
+    const pool = this.suggestPool;
+    if (!pool.length) return;
+    const win: Array<{ label: string; prompt: string }> = [];
+    const span = Math.min(3, pool.length);
+    for (let i = 0; i < span; i++) win.push(pool[(this.suggestOffset + i) % pool.length]);
+    // Offer 换一批 whenever there's more to show than one window, or we can ask
+    // the model for a fresh batch.
+    this.renderSuggestions(win, pool.length > span || this.connected);
+  }
+
+  /** Advance to the next batch, fetching fresh model suggestions when exhausted. */
+  private async cycleSuggestions(): Promise<void> {
+    this.suggestOffset += 3;
+    if (this.suggestOffset >= this.suggestPool.length) {
+      this.suggestOffset = 0;
+      await this.fetchMoreSuggestions();
+    }
+    this.renderSuggestionWindow();
+  }
+
+  /** Ask the model for additional, non-duplicate suggestions for this page. */
+  private async fetchMoreSuggestions(): Promise<void> {
+    if (!this.connected) return;
+    try {
+      const pageContext = extractPageContext();
+      const exclude = this.suggestPool.map((s) => s.label);
+      const { suggestions } = await sendMessage<{
+        suggestions?: Array<{ label: string; prompt: string }>;
+      }>({ type: 'SUGGEST_ACTIONS', pageContext, exclude });
+      const fresh = (suggestions ?? []).filter((s) => s?.label && s?.prompt);
+      const seen = new Set(this.suggestPool.map((s) => s.label));
+      const added = fresh.filter((s) => !seen.has(s.label));
+      if (added.length) this.suggestPool.push(...added);
+    } catch {
+      /* keep the existing pool and just rotate within it */
+    }
   }
 
   /** Heuristically derive operation hints from what's actually on the page. */
@@ -574,29 +897,74 @@ export class AgentWidget {
     out.push({ label: '切换暗色主题', prompt: '把这个页面切换成护眼的暗色主题' });
 
     const seen = new Set<string>();
-    return out.filter((s) => (seen.has(s.label) ? false : seen.add(s.label))).slice(0, 3);
+    return out.filter((s) => (seen.has(s.label) ? false : seen.add(s.label))).slice(0, 8);
   }
 
-  private renderSuggestions(items: Array<{ label: string; prompt: string }>): void {
-    const el = document.createElement('div');
-    el.className = 'msg agent';
-    const chips = items.map((_, i) => `<button class="suggest-chip" data-i="${i}"></button>`).join('');
-    el.innerHTML = `<div class="bubble text">💡 在这个页面，你可以让我：<div class="suggestions">${chips}</div></div>`;
-    const btns = el.querySelectorAll('.suggest-chip');
-    items.forEach((s, i) => {
-      const b = btns[i] as HTMLButtonElement;
-      b.textContent = s.label;
-      b.title = s.prompt;
-      b.addEventListener('click', () => {
+  /** Render page-aware suggestions as gradient pill bars floating next to the ball. */
+  private renderSuggestions(
+    items: Array<{ label: string; prompt: string }>,
+    showRefresh = false
+  ): void {
+    if (!items.length) return;
+    this.suggestBar.innerHTML = '';
+    items.slice(0, 3).forEach((s) => {
+      const pill = document.createElement('button');
+      pill.className = 'suggest-pill';
+      pill.title = s.prompt;
+      pill.innerHTML = `<span class="spark">${sparkSvg()}</span><span class="pill-text"></span>`;
+      (pill.querySelector('.pill-text') as HTMLElement).textContent = s.label;
+      pill.addEventListener('click', () => {
+        this.suggestBar.classList.add('hidden');
+        this.autoOpenSuppressed = false;
+        if (!this.panel.classList.contains('open')) this.openPanel();
+        void this.setMinimized(false);
+        // Run the suggested task right away instead of leaving it in the input.
         this.input.value = s.prompt;
-        this.input.focus();
-        this.input.style.height = 'auto';
-        this.input.style.height = `${Math.min(this.input.scrollHeight, 90)}px`;
+        void this.handleSend();
       });
+      this.suggestBar.appendChild(pill);
     });
-    this.messages.appendChild(el);
-    this.scrollToBottom();
+    if (showRefresh) {
+      const refresh = document.createElement('button');
+      refresh.className = 'suggest-pill refresh';
+      refresh.title = '换一批建议';
+      refresh.innerHTML = `<span class="spark">${refreshSvg()}</span><span class="pill-text">换一批</span>`;
+      refresh.addEventListener('click', (e) => {
+        e.stopPropagation();
+        refresh.classList.remove('spin');
+        // Restart the spin animation each click.
+        void refresh.offsetWidth;
+        refresh.classList.add('spin');
+        void this.cycleSuggestions();
+      });
+      this.suggestBar.appendChild(refresh);
+    }
+    // Only reveal the teaser while the panel is collapsed; it would be redundant
+    // (and visually clash) over an open chat panel.
+    if (!this.panel.classList.contains('open')) {
+      this.suggestBar.classList.remove('hidden');
+      this.positionSuggestBar();
+    }
     clientLog('info', 'ui', '展示页面操作建议', { count: items.length });
+  }
+
+  /** Keep the suggestion pill bar glued to whichever side of the ball has room. */
+  private positionSuggestBar(): void {
+    if (!this.suggestBar || this.suggestBar.classList.contains('hidden')) return;
+    const r = this.ball.getBoundingClientRect();
+    const gap = 12;
+    this.suggestBar.style.top = `${r.top + r.height / 2}px`;
+    this.suggestBar.style.bottom = 'auto';
+    if (r.left < 360) {
+      // Not enough room on the left — flip the pills to the right of the ball.
+      this.suggestBar.style.left = `${r.right + gap}px`;
+      this.suggestBar.style.right = 'auto';
+      this.suggestBar.classList.add('flip');
+    } else {
+      this.suggestBar.style.right = `${window.innerWidth - r.left + gap}px`;
+      this.suggestBar.style.left = 'auto';
+      this.suggestBar.classList.remove('flip');
+    }
   }
 
   private setConnected(connected: boolean): void {
@@ -605,12 +973,40 @@ export class AgentWidget {
   }
 
   private togglePanel(): void {
-    const open = this.panel.classList.toggle('open');
-    if (open) {
-      this.positionPanel();
+    if (this.panel.classList.contains('open')) {
+      this.minimizePanel();
+    } else {
+      this.autoOpenSuppressed = false;
+      this.openPanel();
       this.input.focus();
-      this.badge.classList.remove('show');
-      this.badge.textContent = '';
+      void this.setMinimized(false);
+    }
+  }
+
+  /** Open the panel (idempotent) without touching the user-minimized flag. */
+  private openPanel(): void {
+    this.panel.classList.add('open');
+    this.suggestBar?.classList.add('hidden');
+    this.positionPanel();
+    this.badge.classList.remove('show');
+    this.badge.textContent = '';
+  }
+
+  /** User explicitly collapsed the panel — remember it across navigations. */
+  private minimizePanel(): void {
+    this.panel.classList.remove('open');
+    void this.setMinimized(true);
+    // Surface the suggestion teaser again so the collapsed ball still offers
+    // page-aware shortcuts (with a 换一批 control to cycle batches).
+    void this.showPageSuggestions();
+  }
+
+  private async setMinimized(v: boolean): Promise<void> {
+    this.userMinimized = v;
+    try {
+      await chrome.storage.local.set({ [PANEL_MIN_KEY]: v });
+    } catch {
+      /* storage unavailable — in-memory flag still applies for this page */
     }
   }
 
@@ -659,10 +1055,335 @@ export class AgentWidget {
     const el = document.createElement('div');
     el.className = 'msg agent';
     el.innerHTML = `<div class="bubble text"></div>`;
-    (el.querySelector('.bubble') as HTMLElement).textContent = text;
+    (el.querySelector('.bubble') as HTMLElement).innerHTML = this.mdToHtml(text);
     this.messages.appendChild(el);
     this.scrollToBottom();
     return el;
+  }
+
+  /** Lightweight, safe markdown: code, bold, links, line breaks. */
+  private mdToHtml(text: string): string {
+    return this.escape(text ?? '')
+      .replace(/```([\s\S]*?)```/g, (_m, code: string) => `<pre class="md-pre">${code.replace(/^\n/, '')}</pre>`)
+      .replace(/`([^`\n]+)`/g, '<code class="md-code">$1</code>')
+      .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+      .replace(/\n/g, '<br>');
+  }
+
+  /** Heuristic: is the result rich/long enough to deserve the centered overlay? */
+  private isSubstantialResult(text: string): boolean {
+    const t = (text ?? '').trim();
+    if (!t) return false;
+    if (t.length >= 160) return true;
+    if (/```/.test(t)) return true; // a code/command block
+    if (/(^|\n)\s*\|.+\|/.test(t)) return true; // a markdown table
+    const lines = t.split('\n').filter((l) => l.trim());
+    if (lines.length >= 4) return true;
+    if (lines.filter((l) => /^\s*([-*]|\d+\.)\s+/.test(l)).length >= 3) return true;
+    return false;
+  }
+
+  /** A compact in-chat card that links to the full result overlay. */
+  private addResultCard(title: string, label: string, text: string): void {
+    const preview = text.replace(/`{1,3}/g, '').replace(/\s+/g, ' ').trim().slice(0, 96);
+    const el = document.createElement('div');
+    el.className = 'msg agent';
+    el.innerHTML = `
+      <div class="bubble">
+        <div class="res-card">
+          <div class="res-card-row"><span>📄</span><span></span></div>
+          <div class="res-preview"></div>
+          <div class="inline-actions"><button class="btn-view">🔎 查看完整结果</button></div>
+        </div>
+      </div>`;
+    (el.querySelector('.res-card-row span:last-child') as HTMLElement).textContent = label;
+    (el.querySelector('.res-preview') as HTMLElement).textContent = preview + (text.length > 96 ? '…' : '');
+    (el.querySelector('.btn-view') as HTMLButtonElement).addEventListener('click', () =>
+      this.openResultModal(title, text)
+    );
+    this.messages.appendChild(el);
+    this.scrollToBottom();
+  }
+
+  /** Present substantial output in the centered overlay + a compact chat card. */
+  private presentResult(task: Task, label: string, text: string, autoOpen: boolean): void {
+    const title = task.userRequest?.trim() ? task.userRequest.trim().slice(0, 60) : '任务结果';
+    this.addResultCard(title, label, text);
+    if (autoOpen) this.openResultModal(title, text);
+  }
+
+  private static RESULT_BADGES: Record<string, string> = {
+    code: '💻 代码',
+    table: '📊 表格',
+    links: '🔗 链接',
+    kv: '🧾 信息',
+    list: '📋 清单',
+    article: '📄 摘要',
+  };
+
+  private openResultModal(title: string, content: string): void {
+    this.resultModalRaw = content;
+    const type = this.detectResultType(content);
+    (this.resultModal.querySelector('.rm-title') as HTMLElement).textContent = title || '任务结果';
+    (this.resultModal.querySelector('.rm-badge') as HTMLElement).textContent = AgentWidget.RESULT_BADGES[type];
+
+    const body = this.resultModal.querySelector('.rm-body') as HTMLElement;
+    body.className = `rm-body rm-type-${type}`;
+    body.innerHTML = this.renderResultBody(content, type);
+    body.querySelectorAll('.rm-copy').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const code = decodeURIComponent((btn as HTMLElement).dataset.code ?? '');
+        navigator.clipboard
+          ?.writeText(code)
+          .then(() => {
+            (btn as HTMLElement).textContent = '已复制';
+            setTimeout(() => ((btn as HTMLElement).textContent = '复制'), 1500);
+          })
+          .catch(() => {});
+      });
+    });
+
+    this.renderResultActions(type, content);
+    body.scrollTop = 0;
+    this.resultModal.classList.add('open');
+  }
+
+  /** Type-specific header actions (export CSV for tables, open-all for links). */
+  private renderResultActions(type: ReturnType<AgentWidget['detectResultType']>, content: string): void {
+    const host = this.resultModal.querySelector('.rm-actions') as HTMLElement;
+    host.innerHTML = '';
+    const addBtn = (text: string, onClick: () => void): void => {
+      const b = document.createElement('button');
+      b.className = 'rm-act-btn';
+      b.textContent = text;
+      b.addEventListener('click', onClick);
+      host.appendChild(b);
+    };
+
+    if (type === 'table') {
+      addBtn('⬇ 导出 CSV', () => {
+        const csv = this.tableToCsv(content);
+        if (!csv) return;
+        const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'result.csv';
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+      });
+    } else if (type === 'links') {
+      const links = this.parseLinks(content);
+      if (links.length) {
+        addBtn(`↗ 全部打开 (${links.length})`, () => {
+          links.slice(0, 15).forEach((li) => window.open(li.url, '_blank', 'noopener'));
+        });
+      }
+    }
+  }
+
+  /** Convert the first markdown table in the text to CSV. */
+  private tableToCsv(text: string): string {
+    const lines = text.split('\n');
+    const rows: string[][] = [];
+    const cell = (s: string): string[] => s.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map((c) => c.trim());
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].includes('|') && /^\s*\|?[\s:|-]*-{2,}/.test(lines[i + 1] ?? '')) {
+        rows.push(cell(lines[i]));
+        i++;
+        while (i + 1 < lines.length && lines[i + 1].includes('|') && lines[i + 1].trim()) {
+          rows.push(cell(lines[++i]));
+        }
+        break;
+      }
+    }
+    return rows
+      .map((r) => r.map((c) => (/[",\n]/.test(c) ? `"${c.replace(/"/g, '""')}"` : c)).join(','))
+      .join('\n');
+  }
+
+  private closeResultModal(): void {
+    this.resultModal.classList.remove('open');
+  }
+
+  /** Inline markdown (code, bold, links) → safe HTML. Shared by all templates. */
+  private mdInline(s: string): string {
+    return this.escape(s)
+      .replace(/`([^`]+)`/g, '<code class="md-code">$1</code>')
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+      .replace(/(^|[\s(])(https?:\/\/[^\s)]+)/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
+  }
+
+  private codeBlockHtml(lang: string, raw: string): string {
+    return (
+      `<div class="rm-code"><div class="rm-code-head"><span>${this.escape(lang || 'code')}</span>` +
+      `<button class="rm-copy" data-code="${encodeURIComponent(raw)}">复制</button></div>` +
+      `<pre>${this.escape(raw)}</pre></div>`
+    );
+  }
+
+  /** Classify the result so we can pick the most fitting presentation template. */
+  private detectResultType(text: string): 'code' | 'table' | 'links' | 'kv' | 'list' | 'article' {
+    const t = (text ?? '').trim();
+    if (!t) return 'article';
+    const fences = t.match(/```[\s\S]*?```/g);
+    if (fences && fences.join('').length > t.length * 0.6) return 'code';
+    if (!/\n/.test(t) && /^(\.\/|\$\s|sudo |npm |npx |yarn |pnpm |git |curl |wget |kubectl |docker |python |node )/.test(t)) {
+      return 'code';
+    }
+    if (/(^|\n)\s*\|.+\|/.test(t) && /(^|\n)\s*\|?[\s:|-]*-{2,}/.test(t)) return 'table';
+    const lines = t.split('\n').map((l) => l.trim()).filter(Boolean);
+    const urlCount = (t.match(/https?:\/\/[^\s)]+/g) ?? []).length;
+    const linkLines = lines.filter((l) => /https?:\/\//.test(l));
+    if (lines.length >= 3 && urlCount >= 3 && linkLines.length >= Math.max(3, lines.length * 0.6)) return 'links';
+    const kvLines = lines.filter((l) => /^[^:：]{1,40}[:：]\s*\S/.test(l.replace(/^[-*]\s*/, '')) && !/^https?:/.test(l));
+    if (lines.length >= 3 && kvLines.length >= Math.max(3, lines.length * 0.6)) return 'kv';
+    // Prose (incl. bullet-point summaries like a README overview) reads best as a
+    // flowing rich-text article — the article template already renders <ul> lists.
+    return 'article';
+  }
+
+  private parseLinks(text: string): Array<{ text: string; url: string }> {
+    const out: Array<{ text: string; url: string }> = [];
+    for (const l of text.split('\n')) {
+      const md = l.match(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/);
+      if (md) {
+        out.push({ text: md[1].trim(), url: md[2] });
+        continue;
+      }
+      const u = l.match(/https?:\/\/[^\s)]+/);
+      if (u) {
+        const label = l.replace(u[0], '').replace(/^[-*\d.\s|]+/, '').replace(/[|\-–:：]\s*$/, '').trim();
+        out.push({ text: label || u[0], url: u[0] });
+      }
+    }
+    return out;
+  }
+
+  /** Render the result body using a template chosen for its detected type. */
+  private renderResultBody(text: string, type: ReturnType<AgentWidget['detectResultType']>): string {
+    switch (type) {
+      case 'code': {
+        const blocks = [...text.matchAll(/```(\w*)\n?([\s\S]*?)```/g)];
+        if (blocks.length) {
+          return blocks.map((b) => this.codeBlockHtml(b[1] || 'code', b[2].replace(/\n$/, ''))).join('');
+        }
+        return this.codeBlockHtml('command', text.trim());
+      }
+      case 'links': {
+        const links = this.parseLinks(text);
+        return `<div class="rm-links">${links
+          .map(
+            (li) =>
+              `<a class="rm-link" href="${this.escape(li.url)}" target="_blank" rel="noopener noreferrer">` +
+              `<span class="rm-link-t">${this.escape(li.text)}</span>` +
+              `<span class="rm-link-u">${this.escape(li.url)}</span></a>`
+          )
+          .join('')}</div>`;
+      }
+      case 'kv': {
+        const rows = text
+          .split('\n')
+          .map((l) => l.trim())
+          .filter(Boolean)
+          .map((l) => l.replace(/^[-*]\s*/, '').match(/^([^:：]+)[:：]\s*(.+)$/))
+          .filter((m): m is RegExpMatchArray => !!m);
+        return `<dl class="rm-kv">${rows
+          .map((m) => `<div class="rm-kv-row"><dt>${this.escape(m[1].trim())}</dt><dd>${this.mdInline(m[2].trim())}</dd></div>`)
+          .join('')}</dl>`;
+      }
+      case 'list': {
+        const items = text
+          .split('\n')
+          .map((l) => l.trim())
+          .filter((l) => /^([-*]|\d+\.)\s+/.test(l))
+          .map((l) => l.replace(/^([-*]|\d+\.)\s+/, ''));
+        return `<div class="rm-cards">${items
+          .map((it) => `<div class="rm-card-item"><span class="rm-dot"></span><span>${this.mdInline(it)}</span></div>`)
+          .join('')}</div>`;
+      }
+      case 'table':
+      case 'article':
+      default:
+        return this.renderRichMarkdown(text);
+    }
+  }
+
+  /** Block-level markdown → HTML for the overlay: headings, lists, tables, code. */
+  private renderRichMarkdown(text: string): string {
+    const lines = (text ?? '').replace(/\r\n/g, '\n').split('\n');
+    const splitRow = (s: string): string[] =>
+      s.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map((c) => c.trim());
+    const inline = (s: string): string => this.mdInline(s);
+    const isTableSep = (l?: string): boolean => !!l && /^\s*\|?[\s:|-]*-{2,}[\s:|-]*$/.test(l) && l.includes('-');
+
+    const out: string[] = [];
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      if (/^```/.test(line.trim())) {
+        const lang = line.trim().slice(3).trim();
+        const buf: string[] = [];
+        i++;
+        while (i < lines.length && !/^```/.test(lines[i].trim())) buf.push(lines[i++]);
+        i++; // closing fence
+        const raw = buf.join('\n');
+        out.push(
+          `<div class="rm-code"><div class="rm-code-head"><span>${this.escape(lang || 'code')}</span>` +
+            `<button class="rm-copy" data-code="${encodeURIComponent(raw)}">复制</button></div>` +
+            `<pre>${this.escape(raw)}</pre></div>`
+        );
+        continue;
+      }
+      if (line.includes('|') && isTableSep(lines[i + 1])) {
+        const header = splitRow(line);
+        i += 2;
+        const rows: string[][] = [];
+        while (i < lines.length && lines[i].includes('|') && lines[i].trim()) rows.push(splitRow(lines[i++]));
+        const thead = `<tr>${header.map((h) => `<th>${inline(h)}</th>`).join('')}</tr>`;
+        const tbody = rows.map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join('')}</tr>`).join('');
+        out.push(`<div class="rm-table-wrap"><table class="rm-table">${thead}${tbody}</table></div>`);
+        continue;
+      }
+      const h = line.match(/^(#{1,4})\s+(.*)$/);
+      if (h) {
+        out.push(`<h${h[1].length} class="rm-h">${inline(h[2])}</h${h[1].length}>`);
+        i++;
+        continue;
+      }
+      if (/^\s*[-*]\s+/.test(line)) {
+        const items: string[] = [];
+        while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) items.push(lines[i++].replace(/^\s*[-*]\s+/, ''));
+        out.push(`<ul class="rm-ul">${items.map((it) => `<li>${inline(it)}</li>`).join('')}</ul>`);
+        continue;
+      }
+      if (/^\s*\d+\.\s+/.test(line)) {
+        const items: string[] = [];
+        while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) items.push(lines[i++].replace(/^\s*\d+\.\s+/, ''));
+        out.push(`<ol class="rm-ol">${items.map((it) => `<li>${inline(it)}</li>`).join('')}</ol>`);
+        continue;
+      }
+      if (line.trim() === '') {
+        i++;
+        continue;
+      }
+      const para: string[] = [];
+      while (
+        i < lines.length &&
+        lines[i].trim() !== '' &&
+        !/^```/.test(lines[i].trim()) &&
+        !/^#{1,4}\s/.test(lines[i]) &&
+        !/^\s*[-*]\s+/.test(lines[i]) &&
+        !/^\s*\d+\.\s+/.test(lines[i]) &&
+        !(lines[i].includes('|') && isTableSep(lines[i + 1]))
+      ) {
+        para.push(lines[i++]);
+      }
+      out.push(`<p class="rm-p">${para.map(inline).join('<br>')}</p>`);
+    }
+    return out.join('');
   }
 
   private addSystemMessage(text: string): void {
@@ -693,12 +1414,37 @@ export class AgentWidget {
     this.addUserMessage(text);
     this.input.value = '';
     this.input.style.height = 'auto';
+    this.suggestBar?.classList.add('hidden');
+    // Starting a new task: ensure the panel is considered open for the run so it
+    // persists across any navigations the task triggers.
+    this.autoOpenSuppressed = false;
+    void this.setMinimized(false);
+
+    // If a task is actively running, treat this message as a mid-run steer
+    // (Cursor-style) rather than starting a brand-new task.
+    if (this.currentTask && this.currentTask.status === 'running') {
+      try {
+        const { ok } = await sendMessage<{ ok?: boolean }>({
+          type: 'STEER_TASK',
+          taskId: this.currentTask.id,
+          text,
+        });
+        if (ok) {
+          this.addSystemMessage('🧭 已追加指令，Agent 会在下一步纳入');
+          return;
+        }
+      } catch {
+        /* fall through to creating a new task */
+      }
+    }
+
     this.sendBtn.disabled = true;
     this.setState('thinking');
 
     const thinking = this.addThinking();
     const isLoop = this.loopChk.checked;
     const loopIntervalMs = parseInt(this.loopInterval.value, 10) || 60000;
+    const requestMode = this.modeSelect.value || 'auto';
 
     try {
       await this.ensureSession(text);
@@ -706,6 +1452,7 @@ export class AgentWidget {
         type: 'CREATE_TASK',
         userRequest: text,
         sessionId: this.currentSessionId ?? undefined,
+        requestMode,
         kind: isLoop ? 'loop' : 'once',
         loopIntervalMs: isLoop ? loopIntervalMs : undefined,
         loopMaxIterations: isLoop ? 100 : undefined,
@@ -713,7 +1460,11 @@ export class AgentWidget {
       thinking.remove();
       if (error) throw new Error(error);
       if (task) {
-        this.resetTaskRenderState();
+        // Do NOT force a render-state reset here: a fast task can finish
+        // server-side and arrive via WebSocket (task.update) BEFORE this HTTP
+        // response. Resetting would clear `resultRendered` and re-render the
+        // same answer/question as a duplicate bubble. onTaskUpdate already
+        // resets per new task id on its own.
         this.onTaskUpdate(task);
       }
     } catch (err) {
@@ -725,11 +1476,75 @@ export class AgentWidget {
     }
   }
 
+  /** Token-by-token streaming of a chat answer into a single growing bubble. */
+  private onAgentEvent(taskId: string, event: { kind?: 'delta' | 'done'; text?: string }): void {
+    if (event.kind === 'delta' && event.text) {
+      let bubble = this.streamBubbles.get(taskId);
+      if (!bubble) {
+        bubble = this.addAgentMessage('');
+        this.streamBubbles.set(taskId, bubble);
+        this.setState('thinking');
+      }
+      const inner = bubble.querySelector('.bubble') as HTMLElement;
+      inner.textContent = `${inner.textContent ?? ''}${event.text}`;
+      this.scrollToBottom();
+    }
+  }
+
   private resetTaskRenderState(): void {
     this.renderedLogIds.clear();
     this.planRenderedFor = null;
+    this.planEl = null;
     this.resultRendered = false;
     this.confirmRenderedStep = null;
+  }
+
+  /** Tick off plan steps as the agent advances through them (live todo list). */
+  private updatePlanProgress(task: Task): void {
+    if (!this.planEl || this.planRenderedFor !== task.id) return;
+    const items = this.planEl.querySelectorAll('li.plan-step');
+    const done = Math.min(task.currentStepIndex, items.length);
+    items.forEach((li, i) => li.classList.toggle('done', i < done));
+  }
+
+  /** Offer a one-click "continue" for partial / gave-up runs. */
+  private renderContinue(task: Task): void {
+    const el = document.createElement('div');
+    el.className = 'msg agent';
+    el.innerHTML = `<div class="bubble"><div class="inline-actions"><button class="btn-continue">继续推进</button></div></div>`;
+    this.messages.appendChild(el);
+    this.scrollToBottom();
+    (el.querySelector('.btn-continue') as HTMLButtonElement).addEventListener('click', async () => {
+      el.querySelector('.inline-actions')?.remove();
+      // Continue the SAME task so collected progress / history / plan carry over.
+      this.resultRendered = false;
+      this.setState('working');
+      try {
+        await sendMessage({ type: 'CONTINUE_TASK', taskId: task.id });
+        this.startPolling();
+      } catch (err) {
+        this.addSystemMessage(`继续失败：${err instanceof Error ? err.message : String(err)}`);
+      }
+    });
+  }
+
+  /** Offer a retry for failed runs (re-run the same request). */
+  private renderRetry(task: Task): void {
+    const el = document.createElement('div');
+    el.className = 'msg agent';
+    el.innerHTML = `<div class="bubble"><div class="inline-actions"><button class="btn-retry">重试</button></div></div>`;
+    this.messages.appendChild(el);
+    this.scrollToBottom();
+    (el.querySelector('.btn-retry') as HTMLButtonElement).addEventListener('click', () => {
+      el.querySelector('.inline-actions')?.remove();
+      void this.submitText(task.userRequest);
+    });
+  }
+
+  /** Programmatically submit text through the normal send pipeline. */
+  private async submitText(text: string): Promise<void> {
+    this.input.value = text;
+    await this.handleSend();
   }
 
   private onTaskUpdate(task: Task): void {
@@ -737,10 +1552,22 @@ export class AgentWidget {
     if (isNewTask) this.resetTaskRenderState();
     this.currentTask = task;
 
+    // Keep the panel open for the whole lifecycle of an active task (running,
+    // planning, awaiting confirmation/input) — unless the user minimized it.
+    if (
+      !this.userMinimized &&
+      !this.autoOpenSuppressed &&
+      !this.panel.classList.contains('open') &&
+      ['running', 'planning', 'waiting_confirmation', 'needs_input'].includes(task.status)
+    ) {
+      this.openPanel();
+    }
+
     if (task.plan && this.planRenderedFor !== task.id) {
       this.renderPlanMessage(task);
       this.planRenderedFor = task.id;
     }
+    this.updatePlanProgress(task);
 
     for (const log of task.logs ?? []) {
       if (this.renderedLogIds.has(log.id)) continue;
@@ -776,13 +1603,61 @@ export class AgentWidget {
           this.notifyBadge();
         }
         break;
+      case 'needs_input':
+        this.setState('waiting');
+        if (!this.resultRendered) {
+          this.addAgentMessage(`❓ ${task.clarifyQuestion ?? task.assistantMessage ?? '我需要你补充一些信息才能继续。'}`);
+          this.resultRendered = true;
+          this.notifyBadge();
+        }
+        this.stopPolling();
+        void this.refreshSessionsQuietly();
+        break;
       case 'completed':
         this.setState('happy');
         if (!this.resultRendered) {
-          this.addAgentMessage(`✅ 任务完成\n${task.result ?? ''}`.trim());
+          if (task.mode === 'chat') {
+            // A direct conversational answer. If it already streamed in, finalize
+            // that bubble instead of adding a duplicate.
+            const finalText = task.assistantMessage ?? task.result ?? '';
+            const streamed = this.streamBubbles.get(task.id);
+            if (streamed) {
+              (streamed.querySelector('.bubble') as HTMLElement).innerHTML = this.mdToHtml(finalText);
+              this.streamBubbles.delete(task.id);
+            } else {
+              this.addAgentMessage(finalText);
+            }
+            // Structured/long answers also get the rich centered overlay.
+            if (this.isSubstantialResult(finalText)) {
+              this.openResultModal(task.userRequest?.slice(0, 60) || '回答', finalText);
+            }
+          } else if (task.outcome === 'success' || !task.outcome) {
+            const text = task.result ?? '';
+            if (this.isSubstantialResult(text)) {
+              this.presentResult(task, '✅ 任务完成 · 结果已生成', text, true);
+            } else {
+              this.addAgentMessage(`✅ 任务完成\n${text}`.trim());
+            }
+          } else {
+            // partial / gave_up: be honest, don't claim success.
+            const label = task.outcome === 'partial' ? '部分完成' : '未能完成';
+            const text = task.result ?? '';
+            if (this.isSubstantialResult(text)) {
+              this.presentResult(task, `⚠️ ${label} · 结果`, text, true);
+            } else {
+              this.addAgentMessage(`⚠️ ${label}\n${text}`.trim());
+            }
+            this.renderContinue(task);
+          }
           this.resultRendered = true;
           this.notifyBadge();
-          if (task.recordedSteps?.length && !this.savedWorkflowFor.has(task.id)) {
+          // Only offer to save a workflow when the run genuinely succeeded.
+          if (
+            task.outcome === 'success' &&
+            task.mode !== 'chat' &&
+            task.recordedSteps?.length &&
+            !this.savedWorkflowFor.has(task.id)
+          ) {
             this.renderSaveWorkflow(task);
           }
         }
@@ -793,6 +1668,7 @@ export class AgentWidget {
         this.setState('error');
         if (!this.resultRendered) {
           this.addAgentMessage(`任务失败：${task.error ?? '未知错误'}`);
+          this.renderRetry(task);
           this.resultRendered = true;
           this.notifyBadge();
         }
@@ -841,6 +1717,7 @@ export class AgentWidget {
     this.resetTaskRenderState();
     this.savedWorkflowFor.clear();
     this.messages.innerHTML = '';
+    this.suggestBar?.classList.add('hidden');
     this.closeDrawers();
     this.setState('idle');
     this.addAgentMessage('已开启新会话 ✨\n描述你想完成的任务，我会先制定计划再执行。');
@@ -915,25 +1792,122 @@ export class AgentWidget {
       this.resetTaskRenderState();
       this.savedWorkflowFor.clear();
       this.messages.innerHTML = '';
+      this.suggestBar?.classList.add('hidden');
       this.addSystemMessage(`会话：${session.title}`);
       const history = tasks ?? [];
-      for (const t of history) {
-        this.addUserMessage(t.userRequest);
-        if (t.status === 'completed' && t.result) {
-          this.addAgentMessage(`✅ ${t.result}`);
-        } else if (t.status === 'failed') {
-          this.addAgentMessage(`任务失败：${t.error ?? '未知错误'}`);
+      const live = history.find((t) =>
+        ['running', 'planning', 'waiting_confirmation'].includes(t.status)
+      );
+      if (history.length > 0) {
+        // Replay each task's FULL execution detail (plan + step-by-step logs +
+        // outcome), not just the final answer, so reopening a session preserves
+        // the whole process the user watched live. The live task (if any) is
+        // rendered afterwards via onTaskUpdate so it keeps polling.
+        for (const t of history) {
+          if (live && t.id === live.id) continue;
+          this.renderHistoricalTask(t);
+        }
+      } else {
+        // Sessions with no recorded tasks: fall back to the raw chat thread.
+        for (const m of session.messages ?? []) {
+          if (m.role === 'user') this.addUserMessage(m.content);
+          else if (m.role === 'assistant') this.addAgentMessage(m.content);
+          else this.addSystemMessage(m.content);
         }
       }
       this.closeDrawers();
       if (!this.panel.classList.contains('open')) this.togglePanel();
-      const live = history.find((t) =>
-        ['running', 'planning', 'waiting_confirmation'].includes(t.status)
-      );
       if (live) this.onTaskUpdate(live);
       clientLog('info', 'session', `切换到会话 ${id}`);
     } catch (err) {
       this.addSystemMessage(`加载会话失败：${String(err)}`);
+    }
+  }
+
+  /**
+   * Re-renders a finished task exactly as the user saw it live: the user
+   * request, the plan, the step-by-step thoughts/actions/navigations, and the
+   * final outcome — but statically (no buttons, no polling, no side effects).
+   */
+  private renderHistoricalTask(task: Task): void {
+    this.addUserMessage(task.userRequest);
+
+    const steps = task.plan?.steps ?? [];
+    if (steps.length) {
+      const el = document.createElement('div');
+      el.className = 'msg agent';
+      const list = steps
+        .map(
+          (s: PlanStep) =>
+            `<li class="plan-step ${s.riskLevel === 'high' ? 'risk-high' : ''}">${this.escape(
+              s.description
+            )}${s.requiresConfirmation ? ' ⚠️' : ''}</li>`
+        )
+        .join('');
+      const loopHint = task.kind === 'loop' ? `（循环，每 ${task.loopIntervalMs ?? 0}ms）` : '';
+      el.innerHTML = `
+        <div class="bubble">
+          <div class="plan-title">📋 执行计划${this.escape(loopHint)}（${steps.length} 步）</div>
+          <ol>${list}</ol>
+        </div>`;
+      this.messages.appendChild(el);
+    }
+
+    // Same log filtering the live view uses, so the replay matches what was shown.
+    for (const log of task.logs ?? []) {
+      const m = log.message;
+      if (log.level === 'error') {
+        this.addSystemMessage(`❌ ${m}`);
+      } else if (m.startsWith('🤔') || m.startsWith('📄')) {
+        this.addSystemMessage(m);
+      } else if (m.startsWith('执行:') || m.startsWith('Executing step')) {
+        this.addSystemMessage(`⚙️ ${m}`);
+      } else if (
+        m.startsWith('🧩') ||
+        m.startsWith('🔁') ||
+        m.startsWith('🛠️') ||
+        m.startsWith('⏭️') ||
+        m.startsWith('🧭')
+      ) {
+        this.addSystemMessage(m);
+      } else if (
+        log.level === 'warn' &&
+        (m.includes('确认') || m.includes('重复') || m.includes('调整') || m.includes('重新规划') || m.includes('横跳'))
+      ) {
+        this.addSystemMessage(`⚠️ ${m}`);
+      }
+    }
+
+    switch (task.status) {
+      case 'completed': {
+        const text = (task.mode === 'chat' ? task.assistantMessage ?? task.result : task.result) ?? '';
+        const label =
+          task.mode === 'chat'
+            ? '回答'
+            : task.outcome === 'success' || !task.outcome
+              ? '✅ 任务完成 · 结果'
+              : `⚠️ ${task.outcome === 'partial' ? '部分完成' : '未能完成'} · 结果`;
+        if (task.mode !== 'chat' && this.isSubstantialResult(text)) {
+          // History stays compact: a card that reopens the overlay on demand.
+          this.addResultCard(task.userRequest?.slice(0, 60) || '任务结果', label, text);
+        } else if (task.mode === 'chat') {
+          this.addAgentMessage(text);
+        } else if (task.outcome === 'success' || !task.outcome) {
+          this.addAgentMessage(`✅ 任务完成\n${text}`.trim());
+        } else {
+          this.addAgentMessage(`⚠️ ${task.outcome === 'partial' ? '部分完成' : '未能完成'}\n${text}`.trim());
+        }
+        break;
+      }
+      case 'failed':
+        this.addAgentMessage(`任务失败：${task.error ?? '未知错误'}`);
+        break;
+      case 'needs_input':
+        this.addAgentMessage(`❓ ${task.clarifyQuestion ?? task.assistantMessage ?? ''}`);
+        break;
+      case 'cancelled':
+        this.addSystemMessage('已停止任务');
+        break;
     }
   }
 
@@ -1105,27 +2079,47 @@ export class AgentWidget {
     const list = steps
       .map(
         (s: PlanStep) =>
-          `<li class="${s.riskLevel === 'high' ? 'risk-high' : ''}">${this.escape(s.description)}${
+          `<li class="plan-step ${s.riskLevel === 'high' ? 'risk-high' : ''}">${this.escape(s.description)}${
             s.requiresConfirmation ? ' ⚠️' : ''
           }</li>`
       )
       .join('');
     const loopHint = task.kind === 'loop' ? `（循环，每 ${task.loopIntervalMs ?? 0}ms）` : '';
-    // The task already auto-executes on the server — no manual "开始执行" gate.
-    // Show the plan as a live todo list; the agent adapts it as it runs.
+    // "Plan" mode stops after planning and waits for the user to run it; every
+    // other mode auto-executes and shows the plan as a live, adapting todo list.
+    const planOnly = task.requestMode === 'plan' && task.status === 'pending';
+    const title = planOnly
+      ? `📋 执行计划${this.escape(loopHint)}（${steps.length} 步，待确认）`
+      : `📋 执行计划${this.escape(loopHint)}（${steps.length} 步，自动执行中）`;
+    const actions = planOnly
+      ? `<button class="btn-go run-plan">执行</button><button class="btn-cancel">取消</button>`
+      : `<button class="btn-cancel">停止任务</button>`;
     el.innerHTML = `
       <div class="bubble">
-        <div class="plan-title">📋 执行计划${this.escape(loopHint)}（${steps.length} 步，自动执行中）</div>
+        <div class="plan-title">${title}</div>
         <ol>${list}</ol>
         <div class="plan-hint">计划仅为参考，Agent 会根据页面实际情况动态调整。</div>
-        <div class="inline-actions">
-          <button class="btn-cancel">停止任务</button>
-        </div>
+        <div class="inline-actions">${actions}</div>
       </div>`;
     this.messages.appendChild(el);
+    this.planEl = el;
     this.scrollToBottom();
-    this.setState('working');
-    this.startPolling();
+    if (!planOnly) {
+      this.setState('working');
+      this.startPolling();
+    }
+
+    const runBtn = el.querySelector('.run-plan') as HTMLButtonElement | null;
+    if (runBtn) {
+      runBtn.addEventListener('click', async () => {
+        runBtn.disabled = true;
+        el.querySelector('.inline-actions')?.remove();
+        this.setState('working');
+        await sendMessage({ type: 'START_TASK', taskId: task.id });
+        this.startPolling();
+        await this.refresh();
+      });
+    }
 
     const cancelBtn = el.querySelector('.btn-cancel') as HTMLButtonElement;
     cancelBtn.addEventListener('click', async () => {

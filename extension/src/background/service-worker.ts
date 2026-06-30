@@ -252,28 +252,68 @@ async function runEvaluateOnTab(tabId: number, code: string): Promise<ToolOutcom
     const results = await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
-      func: (src: string) => {
+      func: async (src: string) => {
+        // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+        const compile = (body: string): Function => new Function(`return (async () => {${body}})()`);
+        // First try the code as a single EXPRESSION (auto-return), so models that
+        // write `Array.from(...).map(...)` with no explicit return still yield a
+        // value instead of silently returning undefined (which serializes to {}).
+        let fn: Function | null = null;
         try {
-          // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
-          const fn = new Function(`return (async () => {\n${src}\n})()`);
-          return Promise.resolve(fn()).then(
-            (v: unknown) => ({ ok: true, value: v }),
-            (e: unknown) => ({ ok: false, error: String((e as Error)?.message ?? e) })
-          );
+          fn = compile(`return (\n${src}\n);`);
+        } catch {
+          fn = null;
+        }
+        // Otherwise run it as raw STATEMENTS (its own return / multi-line code).
+        if (!fn) {
+          try {
+            fn = compile(`\n${src}\n`);
+          } catch (e) {
+            return { ok: false, error: String((e as Error)?.message ?? e), syntax: e instanceof SyntaxError };
+          }
+        }
+        try {
+          const value = await fn();
+          return { ok: true, value };
         } catch (e) {
-          return { ok: false, error: String((e as Error)?.message ?? e) };
+          return { ok: false, error: String((e as Error)?.message ?? e), syntax: e instanceof SyntaxError };
         }
       },
       args: [code],
     });
-    const out = results?.[0]?.result as { ok: boolean; value?: unknown; error?: string } | undefined;
+    const out = results?.[0]?.result as
+      | { ok: boolean; value?: unknown; error?: string; syntax?: boolean }
+      | undefined;
     if (!out) return { success: false, error: 'No result returned from page' };
-    if (!out.ok) return { success: false, error: out.error ?? 'evaluate failed' };
+    if (!out.ok) {
+      const base = out.error ?? 'evaluate failed';
+      // Some sites (e.g. github.com) block eval/new Function via CSP. evaluate
+      // can NEVER work there — tell the agent to stop trying it and use DOM tools.
+      if (/content security policy|unsafe-eval|EvalError/i.test(base)) {
+        return {
+          success: false,
+          error: '此页面的内容安全策略(CSP)禁止 evaluate（unsafe-eval 被阻止），evaluate 在本站点无法使用。请改用 click / getHTML / readText / inspect 等 DOM 工具或直接读取页面内容，不要再尝试 evaluate。',
+        };
+      }
+      // Make syntax errors actionable so the agent stops resending broken code.
+      const error = out.syntax
+        ? `evaluate 代码有语法错误（${base}）。不要重发同一段代码——请简化代码、检查括号/引号是否配对，或直接从页面文本/可交互元素读取所需数据。`
+        : base;
+      return { success: false, error };
+    }
     let value = out.value;
     try {
       JSON.stringify(value);
     } catch {
       value = String(value);
+    }
+    // A bare expression that legitimately yields nothing still returns undefined;
+    // flag it so the model doesn't misread "{}" as "the page has no data".
+    if (value === undefined) {
+      return {
+        success: true,
+        result: { value: null, note: 'evaluate 没有返回值（代码可能缺少 return，或目标确实为空）；如需取值，请让最后一个表达式就是要返回的数据。' },
+      };
     }
     return { success: true, result: { value } };
   } catch (err) {
@@ -290,6 +330,19 @@ async function insertCssOnTab(tabId: number, css: string): Promise<ToolOutcome> 
   }
 }
 
+// When the AGENT navigates a tab we note the time, so a freshly (re)loaded page
+// can tell whether the load was agent-driven (keep panel open) or a user's own
+// refresh/new page (stay minimized + show suggestions).
+const agentNavAt = new Map<number, number>();
+const AGENT_NAV_WINDOW_MS = 12000;
+function markAgentNav(tabId: number): void {
+  agentNavAt.set(tabId, Date.now());
+}
+function wasAgentNav(tabId: number): boolean {
+  const at = agentNavAt.get(tabId);
+  return at != null && Date.now() - at < AGENT_NAV_WINDOW_MS;
+}
+
 async function navigateOnTab(tabId: number, args: Record<string, unknown>): Promise<ToolOutcome> {
   const action = String(args.action ?? (args.url ? 'goto' : 'reload')).toLowerCase();
   const timeoutMs = Number(args.timeoutMs) || 15000;
@@ -304,6 +357,7 @@ async function navigateOnTab(tabId: number, args: Record<string, unknown>): Prom
       await chrome.tabs.update(tabId, { url });
     }
     await waitForTabComplete(tabId, timeoutMs);
+    markAgentNav(tabId);
     const pageContext = await getPageContextRetry(tabId);
     return { success: true, result: { navigated: true, action, url: pageContext?.url }, pageContext };
   } catch (err) {
@@ -371,7 +425,18 @@ async function tabTool(args: Record<string, unknown>): Promise<ToolOutcome> {
     if (action === 'open') {
       let url = String(args.url ?? '').trim();
       if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
-      const t = await chrome.tabs.create({ url: url || undefined });
+      // active defaults to true (keep existing behavior); pass active:false to open
+      // a background tab WITHOUT stealing focus from the current (main task) page.
+      const active = args.active === undefined ? true : Boolean(args.active);
+      const t = await chrome.tabs.create({ url: url || undefined, active });
+      // For background sub-task tabs, wait for the page to be ready and return its
+      // context so the caller can act on it immediately.
+      if (t.id != null && url) {
+        await waitForTabComplete(t.id, Number(args.timeoutMs) || 15000);
+        markAgentNav(t.id);
+        const pageContext = await getPageContextRetry(t.id);
+        return { success: true, result: { tabId: t.id, url: t.url }, pageContext };
+      }
       return { success: true, result: { tabId: t.id, url: t.url } };
     }
     if (action === 'close') {
@@ -651,6 +716,7 @@ async function executeContentTool(
     const t = await chrome.tabs.get(tabId);
     if (t.status === 'loading' || (t.url && t.url !== beforeUrl)) {
       await waitForTabComplete(tabId, 15000);
+      markAgentNav(tabId);
       const fresh = await getPageContextRetry(tabId);
       if (fresh) result.pageContext = fresh;
     }
@@ -847,6 +913,25 @@ function connectBackend(): void {
         break;
       }
 
+      case 'agent.event': {
+        const payload = msg.payload as {
+          taskId: string;
+          tabId?: number;
+          kind: 'delta' | 'done';
+          text?: string;
+        };
+        const relayed = {
+          type: 'AGENT_EVENT',
+          taskId: payload.taskId,
+          event: { kind: payload.kind, text: payload.text },
+        };
+        chrome.runtime.sendMessage(relayed).catch(() => {});
+        if (payload.tabId != null) {
+          chrome.tabs.sendMessage(payload.tabId, relayed, { frameId: 0 }).catch(() => {});
+        }
+        break;
+      }
+
       case 'pong':
         break;
     }
@@ -880,8 +965,13 @@ async function apiRequest(path: string, options: RequestInit = {}): Promise<unkn
     },
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ message: res.statusText }));
-    throw new Error((err as { message?: string }).message ?? res.statusText);
+    // Server error routes respond with `{ error }`; tolerate `{ message }` too.
+    const err = await res.json().catch(() => null);
+    const detail =
+      (err as { error?: string; message?: string } | null)?.error ??
+      (err as { error?: string; message?: string } | null)?.message ??
+      res.statusText;
+    throw new Error(detail);
   }
   return res.json();
 }
@@ -910,9 +1000,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           const live = (data.tasks ?? [])
             .filter((t) => t.tabId === tabId && active.includes(t.status))
             .sort((a, b) => b.updatedAt - a.updatedAt)[0];
-          return { task: live ?? null };
+          return { task: live ?? null, agentDriven: wasAgentNav(tabId) };
         } catch {
-          return { task: null };
+          return { task: null, agentDriven: false };
         }
       }
 
@@ -930,6 +1020,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           body: JSON.stringify({
             userRequest: message.userRequest,
             sessionId: message.sessionId,
+            requestMode: message.requestMode,
             tabId: tab?.id,
             url: tab?.url,
             pageContext,
@@ -952,6 +1043,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         return apiRequest(`/api/tasks/${message.taskId}/confirm`, {
           method: 'POST',
           body: JSON.stringify({ confirmed: message.confirmed }),
+        });
+      case 'STEER_TASK':
+        return apiRequest(`/api/tasks/${message.taskId}/steer`, {
+          method: 'POST',
+          body: JSON.stringify({ text: message.text }),
+        });
+      case 'CONTINUE_TASK':
+        return apiRequest(`/api/tasks/${message.taskId}/continue`, { method: 'POST' });
+      case 'SUGGEST_ACTIONS':
+        return apiRequest('/api/suggest', {
+          method: 'POST',
+          body: JSON.stringify({ pageContext: message.pageContext, exclude: message.exclude }),
         });
       case 'GET_TASK':
         return apiRequest(`/api/tasks/${message.taskId}`);

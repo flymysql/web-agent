@@ -3,7 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
-import type { PageContext } from '@ai-browser-agent/shared';
+import type { PageContext, RequestMode } from '@ai-browser-agent/shared';
 import {
   createTask,
   getTask,
@@ -11,13 +11,35 @@ import {
   updateTask,
 } from './tasks/store.js';
 import {
+  appendUserMessage,
+  recordAssistantTurn,
+  listSessions,
+  createSession,
+  getSession,
+  getSessionTasks,
+  renameSession,
+  deleteSession,
+} from './sessions/store.js';
+import {
+  listWorkflows,
+  getWorkflow,
+  updateWorkflow,
+  deleteWorkflow,
+} from './workflows/store.js';
+import { instantiateWorkflow, saveTaskAsWorkflow } from './workflows/service.js';
+import { redactedConfig, setRuntimeConfig } from './config/runtime-config.js';
+import { getDebugLogs, clearDebugLogs, ingestClientLogs } from './debug/logger.js';
+import {
   planTask,
   runTask,
   pauseTask,
   cancelTask,
   resumeTask,
   confirmPendingAction,
+  continueTask,
+  steerTask,
 } from './agent/orchestrator.js';
+import { describeLLM, suggestPageActions } from './llm/provider.js';
 import {
   handleWebSocketConnection,
   broadcastTaskUpdate,
@@ -57,16 +79,27 @@ app.get('/api/tasks/:id', (req, res) => {
 
 app.post('/api/tasks', async (req, res) => {
   try {
-    const { userRequest, tabId, url, pageContext, kind, loopIntervalMs, loopMaxIterations } =
-      req.body as {
-        userRequest: string;
-        tabId?: number;
-        url?: string;
-        pageContext?: PageContext;
-        kind?: 'once' | 'loop';
-        loopIntervalMs?: number;
-        loopMaxIterations?: number;
-      };
+    const {
+      userRequest,
+      sessionId,
+      tabId,
+      url,
+      pageContext,
+      kind,
+      requestMode,
+      loopIntervalMs,
+      loopMaxIterations,
+    } = req.body as {
+      userRequest: string;
+      sessionId?: string;
+      tabId?: number;
+      url?: string;
+      pageContext?: PageContext;
+      kind?: 'once' | 'loop';
+      requestMode?: RequestMode;
+      loopIntervalMs?: number;
+      loopMaxIterations?: number;
+    };
 
     if (!userRequest) {
       return res.status(400).json({ error: 'userRequest is required' });
@@ -74,12 +107,16 @@ app.post('/api/tasks', async (req, res) => {
 
     const task = createTask({
       userRequest,
+      sessionId,
       tabId,
       url,
       kind,
+      requestMode,
       loopIntervalMs,
       loopMaxIterations,
     });
+
+    appendUserMessage(sessionId, task.id, userRequest);
 
     if (pageContext) {
       updateTask(task.id, {
@@ -88,25 +125,32 @@ app.post('/api/tasks', async (req, res) => {
     }
 
     const planned = await planTask(task.id, pageContext);
+    recordAssistantTurn(planned);
 
-    // Auto-execute: no manual "开始执行" gate. The plan is shown to the user as a
-    // live todo list while the agent runs. Progress streams over WebSocket.
-    runTask(planned.id)
-      .then((t) => {
-        if (t.kind === 'loop' && t.loopIntervalMs) scheduleLoopTask(t.id, t.loopIntervalMs);
-        broadcastTaskUpdate(t.id);
-      })
-      .catch((err) => {
-        try {
-          updateTask(planned.id, {
-            status: 'failed',
-            error: err instanceof Error ? err.message : String(err),
-          });
-        } catch {
-          /* ignore */
-        }
-        broadcastTaskUpdate(planned.id);
-      });
+    // Auto-execute only a runnable agent plan. Chat answers (completed),
+    // clarifying questions (needs_input) and explicit "plan" mode stop here and
+    // are shown to the user; the agent's live progress streams over WebSocket.
+    const shouldRun = planned.status === 'pending' && (planned.requestMode ?? 'auto') !== 'plan';
+    if (shouldRun) {
+      runTask(planned.id)
+        .then((t) => {
+          if (t.kind === 'loop' && t.loopIntervalMs) scheduleLoopTask(t.id, t.loopIntervalMs);
+          recordAssistantTurn(getTask(t.id) ?? t);
+          broadcastTaskUpdate(t.id);
+        })
+        .catch((err) => {
+          try {
+            updateTask(planned.id, {
+              status: 'failed',
+              outcome: 'failed',
+              error: err instanceof Error ? err.message : String(err),
+            });
+          } catch {
+            /* ignore */
+          }
+          broadcastTaskUpdate(planned.id);
+        });
+    }
 
     res.status(201).json({ task: planned });
   } catch (err) {
@@ -158,6 +202,37 @@ app.post('/api/tasks/:id/cancel', async (req, res) => {
   }
 });
 
+app.post('/api/tasks/:id/continue', (req, res) => {
+  const taskId = req.params.id;
+  if (!getTask(taskId)) return res.status(404).json({ error: 'Task not found' });
+  // Fire-and-forget: the continuation streams progress over WebSocket; respond
+  // immediately so the UI button doesn't hang for the whole run.
+  continueTask(taskId)
+    .then((t) => {
+      recordAssistantTurn(getTask(t.id) ?? t);
+      broadcastTaskUpdate(t.id);
+    })
+    .catch((err) => {
+      try {
+        updateTask(taskId, {
+          status: 'failed',
+          outcome: 'failed',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      } catch {
+        /* ignore */
+      }
+      broadcastTaskUpdate(taskId);
+    });
+  res.json({ ok: true });
+});
+
+app.post('/api/tasks/:id/steer', (req, res) => {
+  const { text } = req.body as { text?: string };
+  const ok = steerTask(req.params.id, text ?? '');
+  res.json({ ok });
+});
+
 app.post('/api/tasks/:id/confirm', async (req, res) => {
   try {
     const { confirmed } = req.body as { confirmed: boolean };
@@ -169,9 +244,166 @@ app.post('/api/tasks/:id/confirm', async (req, res) => {
   }
 });
 
+app.post('/api/tasks/:id/save-as-workflow', (req, res) => {
+  try {
+    const { name, description, triggers } = req.body as {
+      name: string;
+      description?: string;
+      triggers?: import('@ai-browser-agent/shared').WorkflowTrigger[];
+    };
+    if (!name) return res.status(400).json({ error: 'name is required' });
+    const workflow = saveTaskAsWorkflow(req.params.id, { name, description, triggers });
+    res.status(201).json({ workflow });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 app.get('/api/audit', (req, res) => {
   const limit = parseInt(req.query.limit as string, 10) || 100;
   res.json({ audit: getAuditLog(limit) });
+});
+
+// Page-aware "what can I do here" suggestions, generated from the live page.
+app.post('/api/suggest', async (req, res) => {
+  try {
+    const { pageContext, exclude } = req.body as { pageContext?: PageContext; exclude?: string[] };
+    if (!pageContext) return res.status(400).json({ error: 'pageContext is required' });
+    const suggestions = await suggestPageActions(
+      pageContext,
+      Array.isArray(exclude) ? exclude.filter((s): s is string => typeof s === 'string') : []
+    );
+    res.json({ suggestions });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// ---- Sessions (conversation threads) ----
+
+app.get('/api/sessions', (_req, res) => {
+  res.json({ sessions: listSessions() });
+});
+
+app.post('/api/sessions', (req, res) => {
+  const { title } = req.body as { title?: string };
+  res.status(201).json({ session: createSession(title) });
+});
+
+app.get('/api/sessions/:id', (req, res) => {
+  const session = getSession(req.params.id);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+  res.json({ session, tasks: getSessionTasks(req.params.id) });
+});
+
+app.patch('/api/sessions/:id', (req, res) => {
+  try {
+    const { title } = req.body as { title: string };
+    res.json({ session: renameSession(req.params.id, title) });
+  } catch (err) {
+    res.status(404).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.delete('/api/sessions/:id', (req, res) => {
+  const taskIds = deleteSession(req.params.id);
+  res.json({ ok: true, taskIds });
+});
+
+// ---- Workflows ----
+
+app.get('/api/workflows', (_req, res) => {
+  res.json({ workflows: listWorkflows() });
+});
+
+app.get('/api/workflows/:id', (req, res) => {
+  const workflow = getWorkflow(req.params.id);
+  if (!workflow) return res.status(404).json({ error: 'Workflow not found' });
+  res.json({ workflow });
+});
+
+app.patch('/api/workflows/:id', (req, res) => {
+  try {
+    res.json({ workflow: updateWorkflow(req.params.id, req.body ?? {}) });
+  } catch (err) {
+    res.status(404).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.delete('/api/workflows/:id', (req, res) => {
+  deleteWorkflow(req.params.id);
+  res.json({ ok: true });
+});
+
+app.post('/api/workflows/:id/run', async (req, res) => {
+  try {
+    const workflow = getWorkflow(req.params.id);
+    if (!workflow) return res.status(404).json({ error: 'Workflow not found' });
+    const { params, tabId, url } = req.body as {
+      params?: Record<string, string>;
+      tabId?: number;
+      url?: string;
+    };
+    const task = instantiateWorkflow(workflow, params ?? {}, { tabId, url });
+    runTask(task.id)
+      .then((t) => {
+        if (t.kind === 'loop' && t.loopIntervalMs) scheduleLoopTask(t.id, t.loopIntervalMs);
+        broadcastTaskUpdate(t.id);
+      })
+      .catch((err) => {
+        try {
+          updateTask(task.id, {
+            status: 'failed',
+            outcome: 'failed',
+            error: err instanceof Error ? err.message : String(err),
+          });
+        } catch {
+          /* ignore */
+        }
+        broadcastTaskUpdate(task.id);
+      });
+    res.status(201).json({ task });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// ---- Runtime config (LLM endpoint overrides set from the options page) ----
+
+app.get('/api/config', (_req, res) => {
+  res.json({ config: redactedConfig() });
+});
+
+app.put('/api/config', (req, res) => {
+  setRuntimeConfig(req.body ?? {});
+  res.json({ config: redactedConfig() });
+});
+
+// ---- Debug logs ----
+
+app.get('/api/debug/logs', (req, res) => {
+  const limit = parseInt(req.query.limit as string, 10) || 500;
+  res.json({ logs: getDebugLogs({ limit }) });
+});
+
+app.delete('/api/debug/logs', (_req, res) => {
+  clearDebugLogs();
+  res.json({ ok: true });
+});
+
+app.get('/api/debug/bundle', (req, res) => {
+  const taskId = req.query.taskId as string | undefined;
+  res.json({
+    logs: getDebugLogs({ limit: 2000, taskId }),
+    task: taskId ? getTask(taskId) ?? null : null,
+    generatedAt: Date.now(),
+  });
+});
+
+app.post('/api/debug/client-log', (req, res) => {
+  const { entries } = req.body as { entries?: Array<Record<string, unknown>> };
+  const n = ingestClientLogs(entries ?? []);
+  res.json({ ok: true, ingested: n });
 });
 
 const server = createServer(app);
@@ -191,7 +423,5 @@ startScheduler();
 server.listen(PORT, () => {
   console.log(`[AI Browser Agent] Server running on http://localhost:${PORT}`);
   console.log(`[AI Browser Agent] WebSocket at ws://localhost:${PORT}/ws`);
-  console.log(
-    `[AI Browser Agent] LLM: ${process.env.OPENAI_API_KEY ? 'enabled' : 'rule-based fallback'}`
-  );
+  console.log(`[AI Browser Agent] LLM: ${describeLLM()}`);
 });

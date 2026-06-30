@@ -100,11 +100,23 @@ export const BROWSER_TOOLS: ToolDefinition[] = [
   },
   {
     name: 'injectCSS',
-    description: 'Inject CSS into the page to restyle it (apply a dark theme, change colors/backgrounds/fonts/layout). Reliable and CSP-safe — prefer this for any theming or appearance change.',
+    description:
+      'Inject CSS into the page to restyle it (apply a dark theme, change colors/backgrounds/fonts/layout). Reliable and CSP-safe — prefer this for any theming. Pass a stable id (e.g. "theme") so re-injecting REPLACES the previous block instead of stacking endlessly. Do NOT use "* { background/color !important }" — that paints text the same colour as its background and makes everything invisible.',
     parameters: [
       { name: 'css', type: 'string', description: 'Raw CSS text to inject', required: true },
+      { name: 'id', type: 'string', description: 'Stable id for this style block; re-injecting with the same id replaces it (avoids piling up styles). Use e.g. "theme".', required: false },
     ],
     riskLevel: 'medium',
+    runtime: 'browser',
+  },
+  {
+    name: 'clearInjectedCSS',
+    description:
+      'Undo CSS you previously injected with injectCSS. Pass id to remove just that block, or omit to remove ALL agent-injected CSS and restore the page\'s original appearance. Use this FIRST to recover when your styling broke the page (e.g. the user says text/content disappeared) instead of layering on more CSS.',
+    parameters: [
+      { name: 'id', type: 'string', description: 'Only remove the block with this id (omit to clear everything you injected)', required: false },
+    ],
+    riskLevel: 'low',
     runtime: 'browser',
   },
   {

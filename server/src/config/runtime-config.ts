@@ -7,7 +7,12 @@ export interface RuntimeConfig {
   llmBaseUrl?: string;
   llmModel?: string;
   llmApiKey?: string;
+  /** Per-run step budget before the agent auto-continues (or stops). */
   maxSteps?: number;
+  /** Absolute ceiling across auto-continuations — the runaway backstop. */
+  maxStepsHard?: number;
+  /** Whether to automatically extend the budget instead of stopping at maxSteps. */
+  autoContinue?: boolean;
 }
 
 const repo = new JsonRepository<RuntimeConfig>('config');

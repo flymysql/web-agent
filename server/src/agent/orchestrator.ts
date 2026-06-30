@@ -32,22 +32,66 @@ import { debugLog } from '../debug/logger.js';
 import {
   decideNextAction,
   generateSummaryWithLLM,
+  routeIntent,
+  answerChat,
   type AgentHistoryItem,
 } from '../llm/provider.js';
 
+/** Per-run step budget; the agent auto-continues past this up to the hard cap. */
 function getDefaultMaxSteps(): number {
-  return getRuntimeConfig().maxSteps ?? parseInt(process.env.AGENT_MAX_STEPS ?? '40', 10);
+  return getRuntimeConfig().maxSteps ?? parseInt(process.env.AGENT_MAX_STEPS ?? '99', 10);
+}
+
+/** Absolute ceiling across all auto-continuations — the runaway backstop. */
+function getHardStepCap(): number {
+  const cfg = getRuntimeConfig().maxStepsHard;
+  const fromEnv = parseInt(process.env.AGENT_MAX_STEPS_HARD ?? '600', 10);
+  const cap = cfg ?? fromEnv;
+  // Never let the hard cap fall below a single budget.
+  return Math.max(cap, getDefaultMaxSteps());
+}
+
+/** Whether the agent extends its own budget instead of stopping at maxSteps. */
+function isAutoContinueEnabled(): boolean {
+  const cfg = getRuntimeConfig().autoContinue;
+  if (typeof cfg === 'boolean') return cfg;
+  return process.env.AGENT_AUTO_CONTINUE !== 'false';
 }
 const MAX_CONSECUTIVE_FAILURES = 3;
+/** How many times a single LLM decision can fail (timeout/rate-limit) before giving up. */
+const MAX_DECISION_FAILURES = 4;
 
 /** Task ids with an agent loop currently running — prevents double execution. */
 const activeAgentLoops = new Set<string>();
+
+/** Mid-run user instructions queued to be injected into a running agent loop. */
+const pendingSteers = new Map<string, string[]>();
+
+/**
+ * Inject an extra instruction into a running agent loop (Cursor-style steering).
+ * The loop picks it up on its next iteration as a high-priority correction.
+ */
+export function steerTask(taskId: string, text: string): boolean {
+  const task = getTask(taskId);
+  if (!task) return false;
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (!activeAgentLoops.has(taskId)) return false;
+  const queue = pendingSteers.get(taskId) ?? [];
+  queue.push(trimmed);
+  pendingSteers.set(taskId, queue);
+  addLog(taskId, 'info', `📥 收到追加指令：${trimmed.slice(0, 80)}`);
+  emit(taskId);
+  return true;
+}
 
 export type ToolExecutor = (
   taskId: string,
   tool: string,
   args: Record<string, unknown>,
-  callId: string
+  callId: string,
+  /** When set, run on this tab instead of the task's bound tab (sub-task tabs). */
+  tabIdOverride?: number
 ) => Promise<{ success: boolean; result?: unknown; error?: string; pageContext?: PageContext }>;
 
 let browserToolExecutor: ToolExecutor | null = null;
@@ -68,19 +112,109 @@ function emit(taskId: string): void {
   }
 }
 
+/** Incremental streaming events (chat token deltas, etc.) for live UI. */
+export interface AgentEvent {
+  kind: 'delta' | 'done';
+  text?: string;
+}
+let agentEventNotifier: ((taskId: string, event: AgentEvent) => void) | null = null;
+export function setAgentEventNotifier(fn: (taskId: string, event: AgentEvent) => void): void {
+  agentEventNotifier = fn;
+}
+function emitEvent(taskId: string, event: AgentEvent): void {
+  try {
+    agentEventNotifier?.(taskId, event);
+  } catch {
+    /* ignore notifier errors */
+  }
+}
+
+/**
+ * Route the user's request, then either answer (chat), ask a clarifying
+ * question (clarify), or build an execution plan (agent). The caller decides
+ * whether to auto-run the resulting plan (e.g. 'plan' mode stops after planning).
+ */
 export async function planTask(taskId: string, pageContext?: PageContext): Promise<Task> {
   let task = getTask(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
 
   assertTransition(task.status, 'planning');
   task = updateTask(taskId, { status: 'planning' });
-  addLog(taskId, 'info', 'Planning task...');
 
+  const requestMode = task.requestMode ?? 'auto';
   const conversationContext = buildConversationContext(task.sessionId, taskId);
-  const plan = await createPlan(task.userRequest, pageContext, conversationContext);
-  task = updateTask(taskId, { plan, status: 'pending' });
-  addLog(taskId, 'info', `Plan created with ${plan.steps.length} steps`);
 
+  // 1) Decide intent. A forced composer mode skips the classifier.
+  let intent: 'chat' | 'agent' | 'clarify';
+  let answer: string | undefined;
+  let question: string | undefined;
+  let goal: string | undefined;
+
+  if (requestMode === 'ask') {
+    intent = 'chat';
+  } else if (requestMode === 'agent' || requestMode === 'plan') {
+    intent = 'agent';
+  } else {
+    addLog(taskId, 'info', '🧭 正在判断意图…');
+    emit(taskId);
+    try {
+      const route = await routeIntent(task.userRequest, pageContext, conversationContext);
+      intent = route.kind;
+      answer = route.answer;
+      question = route.question;
+      goal = route.goal;
+    } catch (err) {
+      addLog(taskId, 'warn', `意图判断失败，按执行处理：${err instanceof Error ? err.message : String(err)}`);
+      intent = 'agent';
+    }
+  }
+
+  // 2) Chat: answer directly, no tools, honest success.
+  if (intent === 'chat') {
+    let text = answer?.trim();
+    if (!text) {
+      try {
+        // Stream tokens to the UI as they arrive for a Cursor/Codex-like feel.
+        text = await answerChat(task.userRequest, pageContext, conversationContext, (delta) =>
+          emitEvent(taskId, { kind: 'delta', text: delta })
+        );
+        emitEvent(taskId, { kind: 'done' });
+      } catch (err) {
+        text = `（回答失败：${err instanceof Error ? err.message : String(err)}）`;
+      }
+    }
+    task = updateTask(taskId, {
+      mode: 'chat',
+      intent: 'chat',
+      status: 'completed',
+      outcome: 'success',
+      assistantMessage: text,
+      result: text,
+    });
+    addLog(taskId, 'info', '已直接回答（聊天模式）');
+    emit(taskId);
+    return task;
+  }
+
+  // 3) Clarify: ask the user one question and wait for input.
+  if (intent === 'clarify') {
+    const q = question?.trim() || '能再具体说明一下你的目标吗？';
+    task = updateTask(taskId, {
+      intent: 'clarify',
+      status: 'needs_input',
+      clarifyQuestion: q,
+      assistantMessage: q,
+    });
+    addLog(taskId, 'info', '需要你补充信息');
+    emit(taskId);
+    return task;
+  }
+
+  // 4) Agent: build a plan. Caller auto-runs unless requestMode === 'plan'.
+  addLog(taskId, 'info', 'Planning task...');
+  const plan = await createPlan(goal || task.userRequest, pageContext, conversationContext);
+  task = updateTask(taskId, { plan, status: 'pending', intent: 'agent' });
+  addLog(taskId, 'info', `Plan created with ${plan.steps.length} steps`);
   return task;
 }
 
@@ -211,6 +345,7 @@ async function runReplay(taskId: string): Promise<Task> {
     } else {
       task = updateTask(taskId, {
         status: 'completed',
+        outcome: 'success',
         result: summarizeResult(task),
       });
       addLog(taskId, 'info', 'Task completed successfully');
@@ -297,16 +432,95 @@ function recordWorkflowDraft(task: Task): WorkflowStep[] {
     return out;
   };
 
-  return task.toolCalls
-    .filter((c) => !c.error && c.tool !== 'extractPage')
-    .map((c) => ({
-      id: uuidv4(),
-      description: `${c.tool} ${JSON.stringify(c.args)}`.slice(0, 120),
-      tool: c.tool,
-      args: generalize(c.args),
-      riskLevel: c.riskLevel,
-      requiresConfirmation: c.riskLevel === 'high',
-    }));
+  const kept = pruneToolCalls(task.toolCalls);
+
+  return kept.map((c) => ({
+    id: uuidv4(),
+    description: `${c.tool} ${JSON.stringify(c.args)}`.slice(0, 120),
+    tool: c.tool,
+    args: generalize(c.args),
+    riskLevel: c.riskLevel,
+    requiresConfirmation: c.riskLevel === 'high',
+  }));
+}
+
+/** Pure DOM/inspection tools — they never change page state, so they are noise
+ *  in a saved workflow and can be dropped without affecting replay. */
+const READONLY_TOOLS = new Set([
+  'extractPage',
+  'readText',
+  'getAttribute',
+  'getHTML',
+  'expect',
+  'screenshot',
+]);
+
+const argsEqual = (a: Record<string, unknown>, b: Record<string, unknown>): boolean =>
+  JSON.stringify(a) === JSON.stringify(b);
+
+/**
+ * Strip failed and dead-end steps from the executed tool calls so a saved
+ * workflow contains only the operations that actually matter, WITHOUT changing
+ * the final outcome. Rules (all provably state-preserving):
+ *   1. Drop failed calls and read-only inspections.
+ *   2. Collapse exact consecutive duplicate actions (e.g. the same click retried).
+ *   3. Collapse consecutive navigates (only the final destination matters).
+ *   4. injectCSS / setStyle that target the same id/selector are overwritten, so
+ *      keep only the last attempt per target.
+ *   5. A clearInjectedCSS removes earlier injected styles, so drop both the clear
+ *      and the injectCSS attempts it reverted (the classic "tried a theme, broke
+ *      it, reset it" loop) — leaving only styling applied after the reset.
+ */
+function pruneToolCalls(toolCalls: Task['toolCalls']): Task['toolCalls'] {
+  const successful = toolCalls.filter((c) => !c.error && !READONLY_TOOLS.has(c.tool));
+  const result: Task['toolCalls'] = [];
+
+  const dropInjectCSS = (id: string | null): void => {
+    for (let i = result.length - 1; i >= 0; i--) {
+      const r = result[i];
+      if (r.tool !== 'injectCSS') continue;
+      const rid = r.args.id != null ? String(r.args.id) : null;
+      if (id === null || rid === id) result.splice(i, 1);
+    }
+  };
+
+  for (const c of successful) {
+    // Rule 5: a reset wipes prior styling — remove what it reverted, and the reset
+    // itself is unnecessary on a fresh replay.
+    if (c.tool === 'clearInjectedCSS') {
+      dropInjectCSS(c.args.id != null ? String(c.args.id) : null);
+      continue;
+    }
+
+    const prev = result[result.length - 1];
+
+    // Rule 2: identical action repeated back-to-back.
+    if (prev && prev.tool === c.tool && argsEqual(prev.args, c.args)) continue;
+
+    // Rule 3: consecutive navigates — keep only the latest target.
+    if (prev && prev.tool === 'navigate' && c.tool === 'navigate') {
+      result[result.length - 1] = c;
+      continue;
+    }
+
+    // Rule 4: a re-injected style block with the same id replaces the previous one.
+    if (c.tool === 'injectCSS' && c.args.id != null) {
+      dropInjectCSS(String(c.args.id));
+    }
+    // Rule 4: setStyle on the same selector overwrites the earlier one.
+    if (c.tool === 'setStyle' && c.args.selector != null) {
+      for (let i = result.length - 1; i >= 0; i--) {
+        if (result[i].tool === 'setStyle' && String(result[i].args.selector ?? '') === String(c.args.selector)) {
+          result.splice(i, 1);
+          break;
+        }
+      }
+    }
+
+    result.push(c);
+  }
+
+  return result;
 }
 
 async function recoverReplayStep(
@@ -366,16 +580,25 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
     addLog(taskId, 'info', 'Agent 继续执行');
   }
 
-  const maxSteps = task.maxSteps ?? getDefaultMaxSteps();
+  let maxSteps = task.maxSteps ?? getDefaultMaxSteps();
   const conversationContext = buildConversationContext(task.sessionId, taskId);
   let pageContext = task.checkpoint?.pageContext;
   let consecutiveFailures = 0;
+  let decisionFailures = 0;
   const actionCounts = new Map<string, number>();
+  const thoughtCounts = new Map<string, number>();
+  const urlVisits = new Map<string, number>();
   let lastUrl: string | undefined = pageContext?.url;
   let correction: string | undefined;
+  let correctionTtl = 0;
   let redundantReads = 0;
   let replanned = false;
   let offlineHits = 0;
+  // Navigation and any success reset consecutiveFailures, which can mask a task
+  // that flails for dozens of steps across many URLs. These cumulative tallies
+  // are NEVER reset, so we can escalate (and ultimately ask the user) early.
+  let totalFailures = 0;
+  const errorCounts = new Map<string, number>();
 
   if (activeAgentLoops.has(taskId)) return task;
   activeAgentLoops.add(taskId);
@@ -385,7 +608,24 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
     if (task.status === 'paused' || task.status === 'cancelled') break;
     if (isTerminalStatus(task.status)) break;
     if (task.status === 'waiting_confirmation') break;
-    if (task.currentStepIndex >= maxSteps) break;
+    if (task.currentStepIndex >= maxSteps) {
+      // Auto-continue: rather than stopping at the budget, extend it in place so
+      // long jobs (e.g. dozens of delegated items) keep their collected progress,
+      // history and plan. The hard cap is the runaway backstop.
+      const hardCap = getHardStepCap();
+      if (isAutoContinueEnabled() && task.kind !== 'loop' && maxSteps < hardCap) {
+        maxSteps = Math.min(hardCap, maxSteps + getDefaultMaxSteps());
+        task = updateTask(taskId, { maxSteps });
+        addLog(
+          taskId,
+          'info',
+          `⏭️ 自动续跑：已执行 ${task.currentStepIndex} 步，步数上限提升至 ${maxSteps}（硬上限 ${hardCap}）`
+        );
+        emit(taskId);
+      } else {
+        break;
+      }
+    }
 
     if (!pageContext) {
       addLog(taskId, 'info', '执行: extractPage');
@@ -398,15 +638,47 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
       continue;
     }
 
+    // Pick up any user instructions sent while the agent was running and feed
+    // them in as a high-priority correction (Cursor-style steering).
+    const steers = pendingSteers.get(taskId);
+    if (steers?.length) {
+      pendingSteers.delete(taskId);
+      const note = steers.join('；');
+      correction = `用户追加指令（请优先据此调整）：${note}`;
+      correctionTtl = 3;
+      addLog(taskId, 'info', `🧭 已纳入追加指令：${note.slice(0, 80)}`);
+      emit(taskId);
+    }
+
     // A navigation happened (the page URL changed): that IS progress, so reset the
     // stuck/failure detectors. Otherwise a multi-page task that calls extractPage once
     // per page would falsely trip the "repeated action" guard.
     if (pageContext.url && pageContext.url !== lastUrl) {
       if (lastUrl !== undefined) {
-        actionCounts.clear();
-        consecutiveFailures = 0;
-        addLog(taskId, 'info', `📄 页面已跳转，继续执行：${pageContext.url}`);
-        emit(taskId);
+        const visits = (urlVisits.get(pageContext.url) ?? 0) + 1;
+        urlVisits.set(pageContext.url, visits);
+        if (visits >= 3) {
+          // We keep bouncing back to the same URL (click → navigate → click …).
+          // A changing URL would normally reset the stuck detector, masking the
+          // oscillation. Instead, keep the counters and steer the model to break
+          // the cycle (e.g. use a text selector or ask the user).
+          correction =
+            `检测到你在页面之间反复横跳（已第 ${visits} 次回到 ${pageContext.url}）却没有进展。` +
+            `不要再重复点击同一个链接/导航。如果目标元素就在当前页面，请用文本选择器精确定位` +
+            `（例如 button:has-text('Run workflow') 或 text=Run workflow，也可用页面上下文里的 el-N id）。` +
+            `若确实找不到，请用 needsInput 向用户澄清，而不是继续盲目点击。`;
+          correctionTtl = 3;
+          addLog(taskId, 'warn', `🔁 检测到页面反复横跳（${pageContext.url} ×${visits}），已提示换策略`);
+          emit(taskId);
+        } else {
+          actionCounts.clear();
+          thoughtCounts.clear();
+          consecutiveFailures = 0;
+          correction = undefined;
+          correctionTtl = 0;
+          addLog(taskId, 'info', `📄 页面已跳转，继续执行：${pageContext.url}`);
+          emit(taskId);
+        }
       }
       lastUrl = pageContext.url;
     }
@@ -414,18 +686,51 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
     let decision;
     try {
       decision = await decideNextAction(task.userRequest, pageContext, buildHistory(task), task.plan, conversationContext, correction, progressBlock(task));
-      correction = undefined;
+      decisionFailures = 0;
+      // Keep a correction in effect for a couple of turns so the model actually
+      // changes course, instead of clearing it after a single decision.
+      if (correctionTtl > 0) {
+        correctionTtl--;
+        if (correctionTtl === 0) correction = undefined;
+      } else {
+        correction = undefined;
+      }
     } catch (err) {
-      task = updateTask(taskId, {
-        status: 'failed',
-        error: `决策失败: ${err instanceof Error ? err.message : String(err)}`,
-      });
-      break;
+      // A single LLM hiccup (timeout / rate limit) must NOT kill a long task.
+      // Retry a few times before giving up.
+      decisionFailures++;
+      const msg = err instanceof Error ? err.message : String(err);
+      addLog(taskId, 'warn', `决策失败(${decisionFailures}/${MAX_DECISION_FAILURES})：${msg}`);
+      emit(taskId);
+      if (decisionFailures >= MAX_DECISION_FAILURES) {
+        task = updateTask(taskId, {
+          status: 'failed',
+          outcome: 'failed',
+          error: `决策连续失败：${msg}`,
+        });
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+      continue;
     }
 
     if (decision.thought) {
       addLog(taskId, 'info', `🤔 ${decision.thought}`);
       emit(taskId);
+    }
+
+    // The agent can ask the user for missing info instead of guessing blindly.
+    if (decision.needsInput) {
+      const q = decision.question?.trim() || '我需要更多信息才能继续，能补充一下吗？';
+      task = updateTask(taskId, {
+        status: 'needs_input',
+        intent: 'clarify',
+        clarifyQuestion: q,
+        assistantMessage: q,
+      });
+      addLog(taskId, 'info', '需要你补充信息');
+      emit(taskId);
+      break;
     }
 
     if (decision.done) {
@@ -435,6 +740,7 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
       const finalResult = await finalizeResult(taskId, decision.summary);
       task = updateTask(taskId, {
         status: 'completed',
+        outcome: 'success',
         result: finalResult,
         recordedSteps: recordWorkflowDraft(task),
       });
@@ -461,6 +767,7 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
       redundantReads++;
       correction =
         '你不需要调用 extractPage 读取页面——每一步我都会把最新页面内容提供给你。请直接基于"当前页面/可交互元素"选择一个能推进目标的具体动作（点击某个链接、navigate、delegate 子任务，或在信息已足够时 done 并给出 summary）。';
+      correctionTtl = 2;
       addLog(taskId, 'info', '🛠️ 已跳过冗余的页面读取，提示模型直接行动');
       emit(taskId);
       if (redundantReads >= 3) {
@@ -468,11 +775,13 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
           replanned = true;
           await replanInPlace(taskId, pageContext, '反复尝试读取页面但未推进');
           actionCounts.clear();
+          thoughtCounts.clear();
           redundantReads = 0;
           continue;
         }
         task = updateTask(taskId, {
           status: 'completed',
+          outcome: 'gave_up',
           result: (await finalizeResult(taskId)) + '\n\n⚠️ 多次尝试读取页面但未能继续推进，已停止。',
           recordedSteps: recordWorkflowDraft(task),
         });
@@ -539,12 +848,23 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
       continue;
     }
 
+    // Detect "stuck" both by identical action signature AND by a repeated
+    // thought (the model rephrasing the same intent with a slightly different
+    // selector slips past an args-only check).
     const sig = `${action.tool}:${JSON.stringify(action.args)}`;
-    const seen = (actionCounts.get(sig) ?? 0) + 1;
-    actionCounts.set(sig, seen);
+    const sigSeen = (actionCounts.get(sig) ?? 0) + 1;
+    actionCounts.set(sig, sigSeen);
+    const thoughtKey = (decision.thought || '').trim().toLowerCase();
+    let thoughtSeen = 0;
+    if (thoughtKey) {
+      thoughtSeen = (thoughtCounts.get(thoughtKey) ?? 0) + 1;
+      thoughtCounts.set(thoughtKey, thoughtSeen);
+    }
+    const seen = Math.max(sigSeen, thoughtSeen);
     if (seen === 2) {
       // Second identical attempt — warn the model before it digs in further.
-      correction = `你刚才已经执行过相同动作 ${action.tool}，但没有带来进展。请改用不同的选择器/链接/工具来达成目标；若信息已足够就用 done 结束。`;
+      correction = `你刚才已经执行过相同动作（${action.tool}），但没有带来进展。请改用不同的选择器/链接/工具来达成目标；若信息已足够就用 done 结束；若缺少必要信息就用 needsInput 反问用户。`;
+      correctionTtl = 2;
     }
     if (seen >= 3) {
       if (!replanned) {
@@ -552,13 +872,20 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
         addLog(taskId, 'warn', '🔁 重复动作未见进展，根据当前页面重新规划');
         await replanInPlace(taskId, pageContext, `重复动作 ${action.tool} 未推进`);
         actionCounts.clear();
-        correction = '已根据当前页面生成新计划，请选择与之前不同的下一步，避免重复无效动作。';
+        thoughtCounts.clear();
+        correction =
+          '已根据当前页面生成新计划，请选择与之前不同的下一步，避免重复无效动作。' +
+          '如果你一直在用 evaluate/getHTML 想从列表页提取某个字段却拿不到（说明该字段在每条记录的详情页里），' +
+          '请改用爬取策略：收集每行的详情链接，然后对每个 url 用 delegate 打开详情页提取字段（结果会自动汇总），不要再在列表页重复 evaluate。' +
+          '若目标确实无法达成，再用 needsInput 反问用户。';
+        correctionTtl = 3;
         emit(taskId);
         continue;
       }
-      // Graceful stop instead of a hard failure — keep what was accomplished.
+      // Graceful stop — honestly mark this as "gave up", not a success.
       task = updateTask(taskId, {
         status: 'completed',
+        outcome: 'gave_up',
         result: (await finalizeResult(taskId)) + '\n\n⚠️ 多次尝试后仍无法继续推进，已停止。',
         recordedSteps: recordWorkflowDraft(task),
       });
@@ -596,8 +923,48 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
     }
 
     if (!result.success) {
-      consecutiveFailures++;
+      // A "no-op" click (resolved but produced no page change) is a soft signal:
+      // count it toward the cumulative/recurring-error budget (→ correction, then
+      // ask the user) but NOT toward the abrupt consecutive-failure hard-fail, so a
+      // single slow SPA update doesn't kill an otherwise healthy run.
+      const isNoOp = !!(result.result as { noOp?: boolean } | undefined)?.noOp;
+      if (!isNoOp) consecutiveFailures++;
+      totalFailures++;
       addLog(taskId, 'error', `步骤失败: ${result.error}`);
+
+      // Track failures cumulatively and by recurring error (selector text is
+      // normalized out so "Element not found for '…'" variants collapse to one).
+      const errKey = String(result.error ?? '')
+        .replace(/["'][^"']*["']/g, '…')
+        .slice(0, 60);
+      const errSeen = (errorCounts.get(errKey) ?? 0) + 1;
+      errorCounts.set(errKey, errSeen);
+
+      const FAIL_SOFT = 4;
+      const FAIL_HARD = 8;
+      if (totalFailures >= FAIL_HARD || errSeen >= 4) {
+        // Stop flailing: ask the user instead of burning the whole step budget.
+        const q =
+          '我多次尝试都没能完成这一步——反复找不到目标元素或页面来回跳转，目标很可能在当前页面无法达成' +
+          '（比如该功能/按钮根本不存在）。能否确认目标是否正确，或告诉我更具体的元素名称/位置？';
+        task = updateTask(taskId, {
+          status: 'needs_input',
+          intent: 'clarify',
+          clarifyQuestion: q,
+          assistantMessage: q,
+        });
+        addLog(taskId, 'warn', `⚠️ 累计失败 ${totalFailures} 次（同类错误「${errKey}」×${errSeen}），停止并请用户澄清`);
+        emit(taskId);
+        break;
+      }
+      if (totalFailures === FAIL_SOFT || errSeen === 3) {
+        correction =
+          `你已经失败了 ${totalFailures} 次都没有推进（最近的错误：${errKey}）。不要再用相似的选择器盲目点击或反复导航。` +
+          `请基于「当前页面/可交互元素」里真实存在的 el-N 元素挑一个明显不同的动作；` +
+          `如果目标元素根本不在页面上（功能可能不可用），请立刻用 needsInput 向用户澄清，不要继续试错。`;
+        correctionTtl = 3;
+      }
+
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
         task = updateTask(taskId, { status: 'failed', error: result.error });
         emit(taskId);
@@ -627,14 +994,19 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
         addLog(taskId, 'info', `第 ${iteration} 轮完成,等待下次触发`);
       }
     } else if (task.currentStepIndex >= maxSteps) {
+      const hardCap = getHardStepCap();
+      const hitHardCap = maxSteps >= hardCap;
       task = updateTask(taskId, {
         status: 'completed',
+        outcome: 'partial',
         result:
-          `${await finalizeResult(taskId)}\n\n⚠️ 已达到单次步数上限（${maxSteps} 步）后停止，任务可能尚未完全完成。` +
-          `如需继续，请回复“继续”，或在 .env 中调大 AGENT_MAX_STEPS。`,
+          `${await finalizeResult(taskId)}\n\n⚠️ 已执行 ${task.currentStepIndex} 步` +
+          (hitHardCap
+            ? `，达到硬步数上限（${hardCap}）后停止，任务可能尚未完全完成。点击「继续推进」可在同一任务上接着跑（保留已采集进度），或调大 AGENT_MAX_STEPS_HARD。`
+            : `后停止。点击「继续推进」可在同一任务上接着跑。`),
         recordedSteps: recordWorkflowDraft(task),
       });
-      addLog(taskId, 'warn', `已达最大步数 ${maxSteps}，停止执行`);
+      addLog(taskId, 'warn', `已达步数上限 ${maxSteps}（硬上限 ${hardCap}），停止执行`);
     }
   }
 
@@ -642,12 +1014,14 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
   return task;
   } finally {
     activeAgentLoops.delete(taskId);
+    pendingSteers.delete(taskId);
   }
 }
 
 async function executeStep(
   task: Task,
-  step: PlanStep
+  step: PlanStep,
+  tabIdOverride?: number
 ): Promise<{
   success: boolean;
   result?: unknown;
@@ -686,7 +1060,7 @@ async function executeStep(
     if (!browserToolExecutor) {
       result = { success: false, error: 'Browser not connected' };
     } else {
-      result = await browserToolExecutor(task.id, step.tool, step.args, callId);
+      result = await browserToolExecutor(task.id, step.tool, step.args, callId, tabIdOverride);
     }
   } else if (isBackendTool(step.tool)) {
     result = await executeBackendTool(step.tool, step.args);
@@ -796,16 +1170,25 @@ async function runSubAgent(
   const actionCounts = new Map<string, number>();
   let correction: string | undefined;
 
+  // When a URL is given, run the sub-task in its OWN background tab so the main
+  // task page stays put and keeps focus; the sub tab is closed when we're done.
+  let subTabId: number | undefined;
+  try {
   if (url) {
-    const nav = await executeStep(getTask(taskId)!, makeSyntheticStep('navigate', { url }, `打开 ${url}`));
-    if (nav.pageContext) {
-      pageContext = nav.pageContext;
-      setPageContext(taskId, pageContext);
+    const opened = await executeStep(
+      base,
+      makeSyntheticStep('tab', { action: 'open', url, active: false }, `后台打开 ${url}`)
+    );
+    subTabId = (opened.result as { tabId?: number } | undefined)?.tabId;
+    if (subTabId == null) {
+      return { ok: false, title, content: `无法在后台打开 ${url}：${opened.error ?? '未知错误'}` };
     }
-    subHistory.push({ tool: 'navigate', args: { url }, success: nav.success, error: nav.error, result: nav.success ? 'navigated' : undefined });
-    addLog(taskId, 'info', `🧩↳ 打开 ${url}`);
+    if (opened.pageContext) pageContext = opened.pageContext;
+    subHistory.push({ tool: 'navigate', args: { url }, success: opened.success, error: opened.error, result: opened.success ? 'opened' : undefined });
+    addLog(taskId, 'info', `🧩↳ 后台新标签打开 ${url}`);
     emit(taskId);
   }
+  // No URL → the sub-task operates on the main tab (observe it as before).
   if (!pageContext) pageContext = await observePage(getTask(taskId)!);
   if (!pageContext) return { ok: false, title, content: '子任务无法获取页面内容' };
   if (isOfflinePage(pageContext)) {
@@ -861,11 +1244,13 @@ async function runSubAgent(
     emit(taskId);
     const result = await executeStep(
       getTask(taskId)!,
-      makeSyntheticStep(action.tool, action.args, decision.thought || action.tool)
+      makeSyntheticStep(action.tool, action.args, decision.thought || action.tool),
+      subTabId
     );
     if (result.pageContext) {
       pageContext = result.pageContext;
-      setPageContext(taskId, pageContext);
+      // Don't overwrite the MAIN task's page context with sub-tab content.
+      if (subTabId == null) setPageContext(taskId, pageContext);
     }
     if (pageContext && isOfflinePage(pageContext)) {
       return { ok: false, offline: true, title, content: `无法访问 ${url ?? '页面'}：检测到离线/无网络。` };
@@ -890,6 +1275,17 @@ async function runSubAgent(
     steps++;
   }
   return { ok: true, title, content: lastText || '（子任务步数用尽，未能产出完整摘要）' };
+  } finally {
+    if (subTabId != null) {
+      // Sub-task finished (success, failure, or step budget) → close its
+      // background tab. Focus never left the main task page.
+      await executeStep(base, makeSyntheticStep('tab', { action: 'close', tabId: subTabId }, '关闭子任务标签')).catch(
+        () => undefined
+      );
+      addLog(taskId, 'info', '🧩↳ 已关闭子任务标签');
+      emit(taskId);
+    }
+  }
 }
 
 const OFFLINE_MARKERS = [
@@ -944,10 +1340,11 @@ async function finalizeResult(taskId: string, summary?: string): Promise<string>
 function summarizeResult(task: Task): string {
   const okCalls = task.toolCalls.filter((c) => !c.error);
   const usedTools = Array.from(new Set(okCalls.map((c) => c.tool)));
-  const parts = [`已完成：${task.userRequest}`];
-  parts.push(
-    `共执行 ${okCalls.length} 个操作${usedTools.length ? `（${usedTools.join('、')}）` : ''}`
-  );
+  // Neutral wording: the caller decides success/partial/gave-up framing via
+  // task.outcome, so this must NOT unconditionally claim "已完成".
+  const parts = [
+    `本次共执行 ${okCalls.length} 个操作${usedTools.length ? `（${usedTools.join('、')}）` : ''}`,
+  ];
 
   const lastRead = [...task.toolCalls].reverse().find((c) => c.tool === 'readText' && c.result);
   if (lastRead?.result) {
@@ -1110,5 +1507,33 @@ export async function cancelTask(taskId: string): Promise<Task> {
 }
 
 export async function resumeTask(taskId: string): Promise<Task> {
+  return runTask(taskId);
+}
+
+/**
+ * Continue a stopped agent task IN PLACE — same task id, so the collected
+ * ledger, executed history, plan and currentStepIndex all carry over. The step
+ * budget is extended by one more round beyond wherever it stopped.
+ */
+export async function continueTask(taskId: string): Promise<Task> {
+  let task = getTask(taskId);
+  if (!task) throw new Error(`Task not found: ${taskId}`);
+  if (task.mode === 'chat') return task;
+  if (activeAgentLoops.has(taskId)) return task; // already running
+
+  const base = getDefaultMaxSteps();
+  const newMax = Math.max(task.maxSteps ?? base, task.currentStepIndex) + base;
+  task = updateTask(taskId, {
+    status: 'running',
+    outcome: undefined,
+    error: undefined,
+    maxSteps: newMax,
+  });
+  addLog(
+    taskId,
+    'info',
+    `▶️ 继续执行（同一任务，已执行 ${task.currentStepIndex} 步，步数上限提升至 ${newMax}）`
+  );
+  emit(taskId);
   return runTask(taskId);
 }

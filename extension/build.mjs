@@ -71,10 +71,17 @@ function copyStatic() {
   writeFileSync(resolve(outDir, 'popup.html'), html);
 
   const manifest = JSON.parse(readFileSync(resolve(root, 'manifest.json'), 'utf8'));
+
+  // Background service worker becomes a self-contained classic script.
   manifest.background = { service_worker: 'service-worker.js' };
-  manifest.content_scripts = [
-    { matches: ['<all_urls>'], js: ['content.js'], run_at: 'document_idle', all_frames: true },
-  ];
+
+  // Preserve any content-script options declared in the source manifest
+  // (matches, run_at, all_frames, ...); only swap the compiled JS path.
+  const sourceContentScripts = Array.isArray(manifest.content_scripts)
+    ? manifest.content_scripts
+    : [{ matches: ['<all_urls>'], run_at: 'document_idle', all_frames: true }];
+  manifest.content_scripts = sourceContentScripts.map((cs) => ({ ...cs, js: ['content.js'] }));
+
   manifest.action.default_popup = 'popup.html';
   manifest.options_ui = { page: 'options.html', open_in_tab: true };
   writeFileSync(resolve(outDir, 'manifest.json'), JSON.stringify(manifest, null, 2));

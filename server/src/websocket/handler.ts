@@ -13,6 +13,7 @@ import {
   updateTask,
   addLog,
 } from '../tasks/store.js';
+import { recordAssistantTurn } from '../sessions/store.js';
 import {
   planTask,
   runTask,
@@ -20,8 +21,11 @@ import {
   cancelTask,
   resumeTask,
   confirmPendingAction,
+  steerTask,
   setBrowserToolExecutor,
   setTaskUpdateNotifier,
+  setAgentEventNotifier,
+  type AgentEvent,
 } from '../agent/orchestrator.js';
 import {
   scheduleLoopTask,
@@ -52,6 +56,10 @@ function broadcastTaskUpdate(taskId: string): void {
   const task = getTask(taskId);
   if (!task) return;
 
+  // Persist the assistant turn into the conversation thread on terminal states
+  // (idempotent per task), so any completion path keeps the thread in sync.
+  recordAssistantTurn(task);
+
   for (const { ws } of sessions.values()) {
     send(ws, {
       id: uuidv4(),
@@ -66,7 +74,8 @@ function executeBrowserToolViaWs(
   taskId: string,
   tool: string,
   args: Record<string, unknown>,
-  callId: string
+  callId: string,
+  tabIdOverride?: number
 ): Promise<{ success: boolean; result?: unknown; error?: string; pageContext?: PageContext }> {
   return new Promise((resolve, reject) => {
     const session = sessions.values().next().value;
@@ -96,14 +105,33 @@ function executeBrowserToolViaWs(
     send(session.ws, {
       id: uuidv4(),
       type: 'tool.execute',
-      payload: { taskId, tool, args, callId, tabId: getTask(taskId)?.tabId } satisfies ToolExecutePayload,
+      payload: {
+        taskId,
+        tool,
+        args,
+        callId,
+        tabId: tabIdOverride ?? getTask(taskId)?.tabId,
+      } satisfies ToolExecutePayload,
       timestamp: Date.now(),
     });
   });
 }
 
+function broadcastAgentEvent(taskId: string, event: AgentEvent): void {
+  const tabId = getTask(taskId)?.tabId;
+  for (const { ws } of sessions.values()) {
+    send(ws, {
+      id: uuidv4(),
+      type: 'agent.event',
+      payload: { taskId, tabId, kind: event.kind, text: event.text },
+      timestamp: Date.now(),
+    });
+  }
+}
+
 setBrowserToolExecutor(executeBrowserToolViaWs);
 setTaskUpdateNotifier(broadcastTaskUpdate);
+setAgentEventNotifier(broadcastAgentEvent);
 
 export function handleWebSocketConnection(ws: WebSocket): void {
   ws.on('message', async (data) => {
@@ -223,6 +251,12 @@ export function handleWebSocketConnection(ws: WebSocket): void {
           const { taskId, confirmed } = msg.payload as { taskId: string; confirmed: boolean };
           await confirmPendingAction(taskId, confirmed);
           broadcastTaskUpdate(taskId);
+          break;
+        }
+
+        case 'task.steer': {
+          const { taskId, text } = msg.payload as { taskId: string; text: string };
+          steerTask(taskId, text);
           break;
         }
       }
