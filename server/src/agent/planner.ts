@@ -1,4 +1,4 @@
-import type { PageContext, PlanStep, TaskPlan } from '@ai-browser-agent/shared';
+import type { PageContext, PlanStep, TaskPlan, TaskAttachment } from '@ai-browser-agent/shared';
 import { getToolDefinition, assessRiskFromText } from '@ai-browser-agent/shared';
 import { summarizePageContext } from '../tools/registry.js';
 import { generatePlanWithLLM } from '../llm/provider.js';
@@ -27,10 +27,11 @@ function makeStep(
 export async function createPlan(
   userRequest: string,
   pageContext?: PageContext,
-  conversationContext?: string
+  conversationContext?: string,
+  attachments?: TaskAttachment[]
 ): Promise<TaskPlan> {
   try {
-    return await generatePlanWithLLM(userRequest, pageContext, conversationContext);
+    return await generatePlanWithLLM(userRequest, pageContext, conversationContext, attachments);
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     throw new Error(

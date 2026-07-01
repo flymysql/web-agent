@@ -14,8 +14,7 @@
   ],
   "host_permissions": [
     "http://localhost:3847/*",
-    "https://*/*",
-    "http://*/*"
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "src/background/service-worker.ts",

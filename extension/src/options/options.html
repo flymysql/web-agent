@@ -51,6 +51,21 @@
       </section>
 
       <section class="card">
+        <h2>语音输入</h2>
+        <label class="row">
+          <input id="voiceEnabled" type="checkbox" />
+          启用语音转文字（对话听写 + 录制旁白，需 Chrome 与麦克风权限）
+        </label>
+        <label class="row">
+          <input id="voiceRefine" type="checkbox" />
+          对话听写后用 AI 精简并提取意图
+        </label>
+        <label>识别语言
+          <input id="voiceLang" type="text" placeholder="zh-CN" />
+        </label>
+      </section>
+
+      <section class="card">
         <h2>安全</h2>
         <label>访问令牌 (Auth Token)
           <input id="authToken" type="password" placeholder="后端设置 AGENT_AUTH_TOKEN 时填写" />

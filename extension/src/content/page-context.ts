@@ -1,11 +1,20 @@
-import type { PageContext, InteractiveElement } from '@ai-browser-agent/shared';
+import type { PageContext, InteractiveElement, PageRegion } from '@ai-browser-agent/shared';
 
 const MAX_VISIBLE_TEXT = 8000;
-const MAX_ELEMENTS = 100;
+const MAX_ELEMENTS = 120;
+// Per-region cap so one huge block (e.g. a long results list) can't consume the
+// whole element budget and starve small-but-critical blocks like a filter bar.
+const PER_REGION_CAP = 24;
+const MAX_REGIONS = 40;
+const MAX_HEADINGS = 25;
 // The agent's own floating UI lives in an open shadow root on this host. We must
 // never collect or target it as "page content" — otherwise the agent sees its
 // own buttons/input and starts operating on itself.
 const AGENT_ROOT_ID = 'ai-browser-agent-root';
+
+function clean(s: string, max = 120): string {
+  return s.replace(/\s+/g, ' ').trim().slice(0, max);
+}
 
 function isVisible(el: Element): boolean {
   const rect = el.getBoundingClientRect();
@@ -92,13 +101,167 @@ function tagElement(el: Element, index: number): string {
   return buildSelector(el, index);
 }
 
+let recordIndexCounter = 0;
+
+/** A concise, quote-safe needle for a `:has-text('…')` selector. */
+function textNeedle(label: string): string {
+  return label.replace(/\s+/g, ' ').trim().slice(0, 40).replace(/['"\\]/g, '');
+}
+
+/** How many VISIBLE clickable elements' text/aria contain this needle. */
+function clickableLabelMatches(needle: string): number {
+  const n = needle.toLowerCase();
+  const pool = document.querySelectorAll("a,button,[role='button'],summary,input,textarea,label");
+  let count = 0;
+  for (const el of Array.from(pool)) {
+    if (!isVisible(el)) continue;
+    const t = (el.textContent ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const aria = (el.getAttribute('aria-label') ?? '').toLowerCase();
+    const val = String((el as { value?: unknown }).value ?? '').toLowerCase();
+    if (t.includes(n) || aria.includes(n) || val.includes(n)) {
+      count++;
+      if (count > 1) break;
+    }
+  }
+  return count;
+}
+
+/**
+ * Build the most stable selector for a user-interacted element while recording.
+ *
+ * Unlike the agent's live-DOM selectors, a RECORDED selector must survive a full
+ * page reload during replay. So we only emit reload-durable forms — never the
+ * `data-ai-agent-id` tag fallback (that attribute is set in-memory and is gone on
+ * the freshly loaded replay page) and we prefer a text/label anchor for clickable
+ * targets, which the resolver matches among visible controls even when lazy-loaded
+ * content has shifted structural positions (`:nth-of-type`) around.
+ */
+export function recordSelector(el: Element): string {
+  if (el.id && isStableId(el.id)) return `#${CSS.escape(el.id)}`;
+  const testId = el.getAttribute('data-testid') ?? el.getAttribute('data-test') ?? el.getAttribute('data-cy');
+  if (testId) return `[data-testid="${CSS.escape(testId)}"]`;
+  const name = el.getAttribute('name');
+  if (name && ['INPUT', 'SELECT', 'TEXTAREA'].includes(el.tagName)) {
+    return `${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`;
+  }
+  const aria = el.getAttribute('aria-label');
+  if (aria) return `${el.tagName.toLowerCase()}[aria-label="${CSS.escape(aria)}"]`;
+
+  // Is there a unique structural path? (Reliable only if siblings don't shift.)
+  const path = inShadow(el) ? '' : cssPath(el);
+  let pathUnique = false;
+  try {
+    pathUnique = !!path && document.querySelectorAll(path).length === 1;
+  } catch {
+    /* invalid selector */
+  }
+
+  // Text anchor for a clickable target (itself or nearest clickable ancestor).
+  const target = isActionable(el) ? el : actionableAncestor(el);
+  const needle = target ? textNeedle(accessibleName(target as Element)) : '';
+  if (target && needle.length >= 2) {
+    const tag = (target as Element).tagName.toLowerCase();
+    const textSel = `${tag}:has-text('${needle}')`;
+    // Prefer the text anchor when it uniquely identifies a control, or when we
+    // have no unique structural path to trust anyway.
+    if (clickableLabelMatches(needle) === 1 || !pathUnique) return textSel;
+  }
+
+  if (path) return path;
+
+  // Nothing reload-durable is available (e.g. an unlabeled element in a shadow
+  // root). Fall back to the tagged attribute; it only resolves within the same
+  // live DOM, but it's better than an empty selector.
+  const attr = 'data-ai-agent-id';
+  if (!el.hasAttribute(attr)) el.setAttribute(attr, `el-rec-${recordIndexCounter++}`);
+  return `[data-ai-agent-id="${el.getAttribute(attr)}"]`;
+}
+
+/** Human-meaningful label for a recorded target (accessible name / text). */
+export function describeElement(el: Element): string {
+  return accessibleName(el);
+}
+
 function extractText(el: Element): string {
   const text = (el.textContent ?? '').replace(/\s+/g, ' ').trim();
   return text.slice(0, 200);
 }
 
-function toInteractiveElement(el: Element, index: number): InteractiveElement {
+/** Resolve id references (aria-labelledby / label[for]) within the element's own
+ * tree first, then fall back to the top document. */
+function textFromIds(el: Element, ids: string): string {
+  const root = el.getRootNode() as Document | ShadowRoot;
+  const parts = ids
+    .split(/\s+/)
+    .map((id) => {
+      if (!id) return '';
+      const ref =
+        (root as Document | ShadowRoot).querySelector?.(`#${CSS.escape(id)}`) ??
+        document.getElementById(id);
+      return ref?.textContent ?? '';
+    })
+    .join(' ');
+  return clean(parts);
+}
+
+/**
+ * Compute a human-meaningful name for a control, so the agent understands what
+ * a button/link/field is FOR — not just its raw tag. Site-agnostic: derives
+ * only from standard accessibility conventions.
+ */
+function accessibleName(el: Element): string {
+  const aria = el.getAttribute('aria-label');
+  if (aria && aria.trim()) return clean(aria);
+
+  const labelledby = el.getAttribute('aria-labelledby');
+  if (labelledby) {
+    const t = textFromIds(el, labelledby);
+    if (t) return t;
+  }
+
+  if (el.id) {
+    try {
+      const root = el.getRootNode() as Document | ShadowRoot;
+      const lab = (root as ParentNode).querySelector?.(`label[for="${CSS.escape(el.id)}"]`);
+      if (lab?.textContent?.trim()) return clean(lab.textContent);
+    } catch {
+      /* invalid id for selector */
+    }
+  }
+
+  const wrapLabel = typeof el.closest === 'function' ? el.closest('label') : null;
+  if (wrapLabel?.textContent?.trim()) return clean(wrapLabel.textContent);
+
+  const text = clean(el.textContent ?? '');
+  if (text) return text;
+
+  const title = el.getAttribute('title');
+  if (title?.trim()) return clean(title);
+  const placeholder = el.getAttribute('placeholder');
+  if (placeholder?.trim()) return clean(placeholder);
+  const alt = el.getAttribute('alt');
+  if (alt?.trim()) return clean(alt);
+  const val = (el as { value?: unknown }).value;
+  if (typeof val === 'string' && val.trim()) return clean(val);
+  return '';
+}
+
+function isDisabled(el: Element): boolean {
+  if ((el as { disabled?: unknown }).disabled === true) return true;
+  return el.getAttribute('aria-disabled') === 'true';
+}
+
+function expandedState(el: Element): boolean | undefined {
+  const v = el.getAttribute('aria-expanded');
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  return undefined;
+}
+
+function toInteractiveElement(el: Element, index: number, regionId?: string): InteractiveElement {
   const rect = el.getBoundingClientRect();
+  const name = accessibleName(el);
+  const expanded = expandedState(el);
   return {
     id: `el-${index}`,
     tag: el.tagName.toLowerCase(),
@@ -110,6 +273,10 @@ function toInteractiveElement(el: Element, index: number): InteractiveElement {
     href: el.getAttribute('href') ?? undefined,
     selector: tagElement(el, index),
     visible: isVisible(el),
+    accessibleName: name || undefined,
+    regionId,
+    disabled: isDisabled(el) || undefined,
+    expanded,
     rect: {
       x: Math.round(rect.x),
       y: Math.round(rect.y),
@@ -117,6 +284,174 @@ function toInteractiveElement(el: Element, index: number): InteractiveElement {
       height: Math.round(rect.height),
     },
   };
+}
+
+// --- Region (semantic block) detection -----------------------------------
+// Generic ARIA container roles that mark a meaningful block. No site-specific
+// labels — the category is inferred purely from DOM semantics.
+const CONTAINER_ROLES = new Set([
+  'navigation', 'search', 'main', 'banner', 'contentinfo', 'complementary',
+  'region', 'form', 'dialog', 'alertdialog', 'toolbar', 'tablist', 'tabpanel',
+  'list', 'listbox', 'table', 'grid', 'treegrid', 'menu', 'menubar', 'article',
+  'feed', 'group',
+]);
+
+// Native semantic tags → generic role.
+const TAG_ROLE: Record<string, string> = {
+  main: 'main',
+  nav: 'navigation',
+  header: 'banner',
+  footer: 'contentinfo',
+  aside: 'complementary',
+  form: 'form',
+  section: 'region',
+  dialog: 'dialog',
+  table: 'table',
+};
+
+const REGION_QUERY =
+  'main, nav, header, footer, aside, form, section, dialog, table, [role], [aria-modal="true"]';
+
+/** The generic role for a candidate container, or null if it is not a region. */
+function regionRole(el: Element): string | null {
+  const explicit = (el.getAttribute('role') ?? '').toLowerCase();
+  if (explicit && CONTAINER_ROLES.has(explicit)) return explicit;
+  if (el.getAttribute('aria-modal') === 'true') return 'dialog';
+  const tag = el.tagName.toLowerCase();
+  if (tag in TAG_ROLE) {
+    // A bare <section> with no name is everywhere and mostly noise; only treat
+    // it as a region when it carries an accessible name or a heading.
+    if (tag === 'section') {
+      const named =
+        el.hasAttribute('aria-label') ||
+        el.hasAttribute('aria-labelledby') ||
+        !!el.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]');
+      if (!named) return null;
+    }
+    return TAG_ROLE[tag];
+  }
+  return null;
+}
+
+/** A short label for a region: accessible name, else nearest heading text. */
+function regionLabel(el: Element): string {
+  const aria = el.getAttribute('aria-label');
+  if (aria?.trim()) return clean(aria, 80);
+  const labelledby = el.getAttribute('aria-labelledby');
+  if (labelledby) {
+    const t = textFromIds(el, labelledby);
+    if (t) return t.slice(0, 80);
+  }
+  const heading = el.querySelector('h1,h2,h3,h4,h5,h6,[role="heading"]');
+  if (heading?.textContent?.trim()) return clean(heading.textContent, 80);
+  return '';
+}
+
+interface RegionInfo {
+  host: Element;
+  region: PageRegion;
+}
+
+/** Collect visible region hosts (deep) and assign ids in document order. */
+function collectRegions(): { regions: RegionInfo[]; hostToId: Map<Element, string> } {
+  const candidates: Element[] = [];
+  collectDeep(REGION_QUERY, document, candidates);
+  const seen = new Set<Element>();
+  const regions: RegionInfo[] = [];
+  const hostToId = new Map<Element, string>();
+  let idx = 0;
+  for (const el of candidates) {
+    if (seen.has(el)) continue;
+    seen.add(el);
+    if ((el as HTMLElement).id === AGENT_ROOT_ID) continue;
+    if (el.closest?.(`#${AGENT_ROOT_ID}`)) continue;
+    const role = regionRole(el);
+    if (!role) continue;
+    if (!isVisible(el)) continue;
+    const rect = el.getBoundingClientRect();
+    const id = `region-${idx++}`;
+    const region: PageRegion = {
+      id,
+      role,
+      label: regionLabel(el) || undefined,
+      rect: {
+        x: Math.round(rect.x),
+        y: Math.round(rect.y),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+      },
+    };
+    regions.push({ host: el, region });
+    hostToId.set(el, id);
+  }
+  return { regions, hostToId };
+}
+
+/** Nearest ancestor region host for an element, piercing shadow roots / frames. */
+function regionHostOf(el: Element, hostToId: Map<Element, string>): string | undefined {
+  let node: Element | null = el;
+  let depth = 0;
+  while (node && depth < 80) {
+    const id = hostToId.get(node);
+    if (id) return id;
+    let parent: Element | null = node.parentElement;
+    if (!parent) {
+      const root = node.getRootNode();
+      if (root instanceof ShadowRoot) {
+        parent = root.host as Element;
+      } else {
+        const fe = node.ownerDocument?.defaultView?.frameElement as Element | null;
+        parent = fe ?? null;
+      }
+    }
+    node = parent;
+    depth++;
+  }
+  return undefined;
+}
+
+/** Heading outline (h1-h6 and role=heading), visible, in document order. */
+function collectHeadings(): Array<{ level: number; text: string }> {
+  const nodes: Element[] = [];
+  collectDeep('h1,h2,h3,h4,h5,h6,[role="heading"]', document, nodes);
+  const out: Array<{ level: number; text: string }> = [];
+  for (const el of nodes) {
+    if ((el as HTMLElement).id === AGENT_ROOT_ID) continue;
+    if (el.closest?.(`#${AGENT_ROOT_ID}`)) continue;
+    if (!isVisible(el)) continue;
+    const text = clean(el.textContent ?? '', 100);
+    if (!text) continue;
+    const tag = el.tagName.toLowerCase();
+    let level = tag.length === 2 && tag[0] === 'h' ? Number(tag[1]) : NaN;
+    if (Number.isNaN(level)) {
+      const ariaLevel = Number(el.getAttribute('aria-level'));
+      level = Number.isFinite(ariaLevel) && ariaLevel > 0 ? ariaLevel : 2;
+    }
+    out.push({ level, text });
+    if (out.length >= MAX_HEADINGS) break;
+  }
+  return out;
+}
+
+/** Pick the topmost visible dialog region (the layer the agent should focus on). */
+function findActiveDialog(regions: RegionInfo[]): string | undefined {
+  const dialogs = regions.filter(
+    (r) => r.region.role === 'dialog' || r.region.role === 'alertdialog'
+  );
+  if (!dialogs.length) return undefined;
+  // Prefer the one with the highest stacking context; fall back to last in DOM.
+  let best = dialogs[dialogs.length - 1];
+  let bestZ = -Infinity;
+  for (const d of dialogs) {
+    const z = Number(window.getComputedStyle(d.host).zIndex);
+    const eff = Number.isFinite(z) ? z : 0;
+    if (eff >= bestZ) {
+      bestZ = eff;
+      best = d;
+    }
+  }
+  best.region.modalTop = true;
+  return best.region.id;
 }
 
 const INTERACTIVE_SELECTORS = [
@@ -192,11 +527,43 @@ export function querySelectorDeep(
 }
 
 export function extractPageContext(): PageContext {
+  const { regions, hostToId } = collectRegions();
+
   const collected: Element[] = [];
   collectDeep(INTERACTIVE_SELECTORS, document, collected);
-  const interactiveNodes = collected.filter(isVisible).slice(0, MAX_ELEMENTS);
+  const visibleNodes = collected.filter(isVisible);
 
-  const interactiveElements = interactiveNodes.map((el, i) => toInteractiveElement(el, i));
+  // Per-region budget: keep up to PER_REGION_CAP per block (and a separate cap
+  // for elements outside any region) so a giant list can't crowd out the rest.
+  const perRegionCount = new Map<string, number>();
+  const chosen: Array<{ el: Element; regionId?: string }> = [];
+  for (const el of visibleNodes) {
+    if (chosen.length >= MAX_ELEMENTS) break;
+    const regionId = regionHostOf(el, hostToId);
+    const bucket = regionId ?? '__none__';
+    const count = perRegionCount.get(bucket) ?? 0;
+    if (count >= PER_REGION_CAP) continue;
+    perRegionCount.set(bucket, count + 1);
+    chosen.push({ el, regionId });
+  }
+
+  const interactiveElements = chosen.map((c, i) => toInteractiveElement(c.el, i, c.regionId));
+
+  // Attach element counts and drop regions that ended up empty and unlabeled
+  // (pure structural noise), keeping the list focused for the model.
+  for (const r of regions) {
+    r.region.elementCount = perRegionCount.get(r.region.id) ?? 0;
+  }
+  const activeDialogRegionId = findActiveDialog(regions);
+  const keptRegions = regions
+    .filter(
+      (r) =>
+        (r.region.elementCount ?? 0) > 0 ||
+        !!r.region.label ||
+        r.region.id === activeDialogRegionId
+    )
+    .slice(0, MAX_REGIONS)
+    .map((r) => r.region);
 
   const formFields = interactiveElements.filter(
     (el) => ['input', 'select', 'textarea'].includes(el.tag) || el.role === 'textbox'
@@ -206,7 +573,7 @@ export function extractPageContext(): PageContext {
     .filter((el) => el.tag === 'a' && el.href)
     .slice(0, 50)
     .map((el) => ({
-      text: el.text ?? '',
+      text: el.accessibleName ?? el.text ?? '',
       href: el.href ?? '',
       selector: el.selector,
     }));
@@ -221,6 +588,9 @@ export function extractPageContext(): PageContext {
     interactiveElements,
     formFields,
     links,
+    regions: keptRegions,
+    headings: collectHeadings(),
+    activeDialogRegionId,
     timestamp: Date.now(),
   };
 }
@@ -237,9 +607,9 @@ export function getVisibleText(selector?: string): string {
 /**
  * Parses Playwright/jQuery-style text selectors that the model frequently
  * emits but native querySelector rejects:
- *   text=Run workflow
- *   button:has-text('Run workflow')
- *   a:contains("build")
+ *   text=Submit
+ *   button:has-text('Submit')
+ *   a:contains("Details")
  * Returns the leading CSS portion (or '*') plus the target text.
  */
 function parseTextSelector(selector: string): { leading: string; text: string } | null {
@@ -353,6 +723,6 @@ export function resolveSelector(selector: string): Element {
 
   throw new Error(
     `Element not found for "${selector}". Use a plain CSS selector, an el-N id ` +
-      `from the page context, or text matching like button:has-text('Run workflow') or text=Run workflow.`
+      `from the page context, or text matching like button:has-text('<label>') or text=<label>.`
   );
 }

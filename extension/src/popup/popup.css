@@ -1,3 +1,43 @@
+/* iOS design language — matches the in-page floating UI */
+:root {
+  --blue: #0a84ff;
+  --blue-press: #0060df;
+  --green: #34c759;
+  --green-press: #248a3d;
+  --red: #ff3b30;
+  --red-press: #d70015;
+  --bg: #f2f2f7;
+  --bg-elev: #ffffff;
+  --label: #1c1c1e;
+  --label-2: rgba(60,60,67,0.6);
+  --label-3: rgba(60,60,67,0.3);
+  --separator: rgba(60,60,67,0.16);
+  --fill: rgba(118,118,128,0.12);
+  --fill-2: rgba(118,118,128,0.22);
+  --r-lg: 18px;
+  --r-md: 14px;
+  --r-sm: 10px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --blue: #0a84ff;
+    --blue-press: #409cff;
+    --green: #30d158;
+    --green-press: #30d158;
+    --red: #ff453a;
+    --red-press: #ff453a;
+    --bg: #1c1c1e;
+    --bg-elev: #2c2c2e;
+    --label: #ffffff;
+    --label-2: rgba(235,235,245,0.6);
+    --label-3: rgba(235,235,245,0.3);
+    --separator: rgba(84,84,88,0.65);
+    --fill: rgba(120,120,128,0.24);
+    --fill-2: rgba(120,120,128,0.4);
+  }
+}
+
 * {
   box-sizing: border-box;
   margin: 0;
@@ -6,10 +46,11 @@
 
 body {
   width: 420px;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, 'PingFang SC', sans-serif;
+  -webkit-font-smoothing: antialiased;
   font-size: 13px;
-  color: #1a1a2e;
-  background: #f8f9fc;
+  color: var(--label);
+  background: var(--bg);
 }
 
 .app {
@@ -24,35 +65,46 @@ header {
 }
 
 header h1 {
-  font-size: 16px;
-  font-weight: 600;
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
 }
 
 .status {
   font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 10px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
 }
 
 .status.connected {
-  background: #d1fae5;
-  color: #065f46;
+  background: rgba(52,199,89,0.16);
+  color: var(--green-press);
 }
 
 .status.disconnected {
-  background: #fee2e2;
-  color: #991b1b;
+  background: rgba(255,59,48,0.14);
+  color: var(--red-press);
 }
 
 .input-section textarea {
   width: 100%;
-  padding: 10px;
-  border: 1px solid #d1d5db;
-  border-radius: 8px;
+  padding: 11px 13px;
+  border: 0.5px solid var(--separator);
+  border-radius: var(--r-md);
+  background: var(--bg-elev);
+  color: var(--label);
   resize: vertical;
   font-family: inherit;
-  font-size: 13px;
+  font-size: 14px;
   margin-bottom: 8px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.input-section textarea:focus {
+  outline: none;
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(10,132,255,0.15);
 }
 
 .options {
@@ -61,53 +113,70 @@ header h1 {
   align-items: center;
   margin-bottom: 12px;
   font-size: 12px;
+  color: var(--label-2);
 }
 
 .options input[type="number"] {
   width: 100px;
-  padding: 4px 8px;
-  border: 1px solid #d1d5db;
-  border-radius: 4px;
+  padding: 5px 9px;
+  border: 0.5px solid var(--separator);
+  border-radius: var(--r-sm);
+  background: var(--bg-elev);
+  color: var(--label);
 }
 
 .btn {
-  padding: 8px 14px;
-  border: 1px solid #d1d5db;
-  border-radius: 6px;
-  background: #fff;
+  padding: 9px 16px;
+  border: 0.5px solid var(--separator);
+  border-radius: 999px;
+  background: var(--bg-elev);
+  color: var(--blue);
   cursor: pointer;
-  font-size: 12px;
-  transition: background 0.15s;
+  font-size: 13px;
+  font-weight: 600;
+  transition: background 0.15s, transform 0.12s, filter 0.15s;
 }
 
 .btn:hover {
-  background: #f3f4f6;
+  background: var(--fill);
+}
+
+.btn:active {
+  transform: scale(0.97);
 }
 
 .btn.primary {
-  background: #4f46e5;
+  background: var(--blue);
   color: #fff;
-  border-color: #4f46e5;
+  border-color: transparent;
 }
 
 .btn.primary:hover {
-  background: #4338ca;
+  background: var(--blue-press);
 }
 
 .btn.success {
-  background: #059669;
+  background: var(--green);
   color: #fff;
-  border-color: #059669;
+  border-color: transparent;
+}
+
+.btn.success:hover {
+  background: var(--green-press);
 }
 
 .btn.danger {
-  background: #dc2626;
+  background: var(--red);
   color: #fff;
-  border-color: #dc2626;
+  border-color: transparent;
+}
+
+.btn.danger:hover {
+  background: var(--red-press);
 }
 
 .btn.tiny {
-  padding: 3px 8px;
+  padding: 4px 10px;
   font-size: 11px;
 }
 
@@ -128,7 +197,7 @@ header h1 {
   align-items: center;
   font-size: 12px;
   font-weight: 600;
-  color: #6b7280;
+  color: var(--label-2);
   margin-bottom: 8px;
 }
 
@@ -139,7 +208,7 @@ header h1 {
 }
 
 .workflow-list .empty {
-  color: #9ca3af;
+  color: var(--label-2);
   font-size: 12px;
   padding: 6px 0;
 }
@@ -149,20 +218,20 @@ header h1 {
   justify-content: space-between;
   align-items: center;
   gap: 8px;
-  padding: 8px 10px;
-  background: #fff;
-  border: 1px solid #eceef5;
-  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--bg-elev);
+  border: 0.5px solid var(--separator);
+  border-radius: var(--r-md);
 }
 
 .wf-name {
-  font-weight: 500;
-  font-size: 13px;
+  font-weight: 600;
+  font-size: 14px;
 }
 
 .wf-meta {
   font-size: 11px;
-  color: #9ca3af;
+  color: var(--label-2);
   margin-top: 2px;
 }
 
@@ -182,7 +251,7 @@ header h1 {
 }
 
 .task-section {
-  border-top: 1px solid #e5e7eb;
+  border-top: 0.5px solid var(--separator);
   padding-top: 12px;
   margin-top: 12px;
 }
@@ -196,24 +265,25 @@ header h1 {
 
 .badge {
   font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 10px;
-  background: #e0e7ff;
-  color: #3730a3;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: rgba(10,132,255,0.14);
+  color: var(--blue);
   text-transform: uppercase;
 }
 
 .task-id {
   font-size: 10px;
-  color: #6b7280;
-  font-family: monospace;
+  color: var(--label-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 .plan-view {
-  background: #fff;
-  border: 1px solid #e5e7eb;
-  border-radius: 8px;
-  padding: 10px;
+  background: var(--bg-elev);
+  border: 0.5px solid var(--separator);
+  border-radius: var(--r-md);
+  padding: 12px;
   max-height: 150px;
   overflow-y: auto;
   font-size: 12px;
@@ -228,22 +298,22 @@ header h1 {
 }
 
 .plan-view .risk-high {
-  color: #dc2626;
+  color: var(--red);
 }
 
 .confirmation {
-  background: #fef3c7;
-  border: 1px solid #f59e0b;
-  border-radius: 8px;
-  padding: 10px;
+  background: rgba(255,204,0,0.14);
+  border: 0.5px solid rgba(255,204,0,0.5);
+  border-radius: var(--r-md);
+  padding: 12px;
   margin: 8px 0;
 }
 
 .result-view {
-  background: #ecfdf5;
-  border: 1px solid #a7f3d0;
-  border-radius: 8px;
-  padding: 10px;
+  background: rgba(52,199,89,0.1);
+  border: 0.5px solid rgba(52,199,89,0.35);
+  border-radius: var(--r-md);
+  padding: 12px;
   font-size: 12px;
   margin-top: 8px;
 }
@@ -251,11 +321,11 @@ header h1 {
 .log-view {
   background: #1e1e2e;
   color: #cdd6f4;
-  border-radius: 8px;
-  padding: 10px;
+  border-radius: var(--r-md);
+  padding: 12px;
   max-height: 120px;
   overflow-y: auto;
-  font-family: monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11px;
   margin-top: 8px;
 }

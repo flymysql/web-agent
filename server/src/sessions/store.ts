@@ -1,7 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import type { ChatSession, ChatMessage, Task } from '@ai-browser-agent/shared';
 import { JsonRepository } from '../persistence/json-repository.js';
-import { getTask } from '../tasks/store.js';
+import { getTask, listTasks } from '../tasks/store.js';
 
 const sessions = new JsonRepository<ChatSession>('sessions');
 
@@ -52,7 +52,12 @@ export function touchSession(id: string): void {
 }
 
 /** Attach a task to a session, deriving the session title from the first request. */
-export function addTaskToSession(sessionId: string, taskId: string, request?: string): ChatSession | undefined {
+export function addTaskToSession(
+  sessionId: string | undefined,
+  taskId: string,
+  request?: string
+): ChatSession | undefined {
+  if (!sessionId) return undefined;
   const session = sessions.get(sessionId);
   if (!session) return undefined;
   const taskIds = session.taskIds.includes(taskId) ? session.taskIds : [...session.taskIds, taskId];
@@ -112,10 +117,18 @@ export function recordAssistantTurn(task: Task): void {
 export function getSessionTasks(id: string): Task[] {
   const session = sessions.get(id);
   if (!session) return [];
-  return session.taskIds
-    .map((taskId) => getTask(taskId))
-    .filter((t): t is Task => Boolean(t))
-    .sort((a, b) => a.createdAt - b.createdAt);
+  const byId = new Map<string, Task>();
+  for (const taskId of session.taskIds) {
+    const t = getTask(taskId);
+    if (t) byId.set(t.id, t);
+  }
+  // Self-heal: also include any task that stamped this session on itself but was
+  // never linked into `taskIds` (e.g. a task created before linking, or a lost
+  // update). This keeps history a faithful replay even if the link is missing.
+  for (const t of listTasks()) {
+    if (t.sessionId === id) byId.set(t.id, t);
+  }
+  return [...byId.values()].sort((a, b) => a.createdAt - b.createdAt);
 }
 
 /**

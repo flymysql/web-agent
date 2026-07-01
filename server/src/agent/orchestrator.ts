@@ -27,6 +27,7 @@ import {
 import { executeBackendTool } from '../tools/registry.js';
 import { buildConversationContext } from '../sessions/store.js';
 import { getWorkflow } from '../workflows/store.js';
+import { resolveParamValues } from '../workflows/service.js';
 import { getRuntimeConfig } from '../config/runtime-config.js';
 import { debugLog } from '../debug/logger.js';
 import {
@@ -34,6 +35,7 @@ import {
   generateSummaryWithLLM,
   routeIntent,
   answerChat,
+  isVisionEnabled,
   type AgentHistoryItem,
 } from '../llm/provider.js';
 
@@ -60,6 +62,19 @@ function isAutoContinueEnabled(): boolean {
 const MAX_CONSECUTIVE_FAILURES = 3;
 /** How many times a single LLM decision can fail (timeout/rate-limit) before giving up. */
 const MAX_DECISION_FAILURES = 4;
+/** Consecutive no-change steps before we replan; and before we honestly give up. */
+const NO_PROGRESS_SOFT = 6;
+const NO_PROGRESS_HARD = 10;
+/**
+ * Injected when the page has stopped changing for several steps: the current
+ * sub-goal is likely blocked (element missing, content empty, or an unreadable
+ * canvas/virtualized area). Site-agnostic guidance to move on and stay honest.
+ */
+const STUCK_SKIP_CORRECTION =
+  '连续多步操作都没有让页面发生任何变化，说明当前这个子目标很可能受阻（目标元素不存在、内容为空，或日志/内容在无法读取的画布/虚拟滚动区域里）。' +
+  '不要再在这一个点上反复换选择器重试：如果整体任务还有其它可以独立完成的部分，先跳过这个子目标去完成其余部分；' +
+  '把已经拿到的结果如实汇总（用 done 给出 summary，说明哪些拿到了、哪一部分受阻）；' +
+  '如果整个目标都卡在这个受阻点，就用 needsInput 向用户说明卡在哪里并请求帮助。绝不要谎报成功。';
 
 /** Task ids with an agent loop currently running — prevents double execution. */
 const activeAgentLoops = new Set<string>();
@@ -158,7 +173,7 @@ export async function planTask(taskId: string, pageContext?: PageContext): Promi
     addLog(taskId, 'info', '🧭 正在判断意图…');
     emit(taskId);
     try {
-      const route = await routeIntent(task.userRequest, pageContext, conversationContext);
+      const route = await routeIntent(task.userRequest, pageContext, conversationContext, task.attachments);
       intent = route.kind;
       answer = route.answer;
       question = route.question;
@@ -175,8 +190,12 @@ export async function planTask(taskId: string, pageContext?: PageContext): Promi
     if (!text) {
       try {
         // Stream tokens to the UI as they arrive for a Cursor/Codex-like feel.
-        text = await answerChat(task.userRequest, pageContext, conversationContext, (delta) =>
-          emitEvent(taskId, { kind: 'delta', text: delta })
+        text = await answerChat(
+          task.userRequest,
+          pageContext,
+          conversationContext,
+          (delta) => emitEvent(taskId, { kind: 'delta', text: delta }),
+          task.attachments
         );
         emitEvent(taskId, { kind: 'done' });
       } catch (err) {
@@ -212,7 +231,7 @@ export async function planTask(taskId: string, pageContext?: PageContext): Promi
 
   // 4) Agent: build a plan. Caller auto-runs unless requestMode === 'plan'.
   addLog(taskId, 'info', 'Planning task...');
-  const plan = await createPlan(goal || task.userRequest, pageContext, conversationContext);
+  const plan = await createPlan(goal || task.userRequest, pageContext, conversationContext, task.attachments);
   task = updateTask(taskId, { plan, status: 'pending', intent: 'agent' });
   addLog(taskId, 'info', `Plan created with ${plan.steps.length} steps`);
   return task;
@@ -552,6 +571,23 @@ async function recoverReplayStep(
   }
 }
 
+/**
+ * Capture a viewport screenshot for the optional vision layer. Runs the browser
+ * `screenshot` tool DIRECTLY (bypassing executeStep) so it never pollutes the
+ * task history/audit — it's context for the model, not an agent action. Returns
+ * a dataURL, or undefined if vision is off or capture fails.
+ */
+async function captureScreenshotForVision(task: Task): Promise<string | undefined> {
+  if (!isVisionEnabled() || !browserToolExecutor) return undefined;
+  try {
+    const res = await browserToolExecutor(task.id, 'screenshot', {}, uuidv4(), undefined);
+    const dataUrl = (res.result as { dataUrl?: string } | undefined)?.dataUrl;
+    return typeof dataUrl === 'string' && dataUrl.startsWith('data:') ? dataUrl : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function observePage(task: Task): Promise<PageContext | undefined> {
   const obs = await executeStep(task, makeSyntheticStep('extractPage', {}, '观察页面'));
   if (obs.pageContext) {
@@ -599,6 +635,44 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
   // are NEVER reset, so we can escalate (and ultimately ask the user) early.
   let totalFailures = 0;
   const errorCounts = new Map<string, number>();
+  // No-progress ("stuck") tracking: the page/collected state stops changing even
+  // though the model keeps trying different tools/selectors for the same goal.
+  let noProgressSteps = 0;
+  let lastProgressDigest: string | undefined;
+
+  // Rehydrate the anti-flail counters if we're resuming (e.g. after a high-risk
+  // confirmation). Without this, every resume re-enters with zeroed guards, so a
+  // task that periodically pauses for confirmation can never trip the give-up /
+  // ask-the-user safety nets. Cumulative tallies (totalFailures/errorCounts) are
+  // intentionally carried over; navigation still resets the per-turn counters.
+  const g0 = task.guardState;
+  if (g0) {
+    totalFailures = g0.totalFailures ?? 0;
+    consecutiveFailures = g0.consecutiveFailures ?? 0;
+    redundantReads = g0.redundantReads ?? 0;
+    replanned = g0.replanned ?? false;
+    noProgressSteps = g0.noProgressSteps ?? 0;
+    lastProgressDigest = g0.lastProgressDigest;
+    for (const [k, v] of Object.entries(g0.errorCounts ?? {})) errorCounts.set(k, v);
+    for (const [k, v] of Object.entries(g0.actionCounts ?? {})) actionCounts.set(k, v);
+    for (const [k, v] of Object.entries(g0.thoughtCounts ?? {})) thoughtCounts.set(k, v);
+  }
+
+  const persistGuards = (): void => {
+    task = updateTask(taskId, {
+      guardState: {
+        totalFailures,
+        consecutiveFailures,
+        errorCounts: Object.fromEntries(errorCounts),
+        actionCounts: Object.fromEntries(actionCounts),
+        thoughtCounts: Object.fromEntries(thoughtCounts),
+        redundantReads,
+        replanned,
+        noProgressSteps,
+        lastProgressDigest,
+      },
+    });
+  };
 
   if (activeAgentLoops.has(taskId)) return task;
   activeAgentLoops.add(taskId);
@@ -665,7 +739,7 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
           correction =
             `检测到你在页面之间反复横跳（已第 ${visits} 次回到 ${pageContext.url}）却没有进展。` +
             `不要再重复点击同一个链接/导航。如果目标元素就在当前页面，请用文本选择器精确定位` +
-            `（例如 button:has-text('Run workflow') 或 text=Run workflow，也可用页面上下文里的 el-N id）。` +
+            `（例如 text=<标签文字> 或 tag:has-text('<标签文字>')，也可用页面上下文里的 el-N id）。` +
             `若确实找不到，请用 needsInput 向用户澄清，而不是继续盲目点击。`;
           correctionTtl = 3;
           addLog(taskId, 'warn', `🔁 检测到页面反复横跳（${pageContext.url} ×${visits}），已提示换策略`);
@@ -683,9 +757,52 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
       lastUrl = pageContext.url;
     }
 
+    // No-progress ("stuck") detector. The per-action / per-thought guards below
+    // only catch VERBATIM repeats; a model that keeps trying different tools and
+    // selectors for the same unmet goal slips past them while the page stays
+    // frozen. Track a coarse state fingerprint (url + element count + collected
+    // items); if it doesn't move for several steps, replan once, then give up
+    // honestly — regardless of how varied the individual actions look.
+    const collectedCount = getTask(taskId)?.collected?.length ?? 0;
+    const progressDigest = `${pageContext.url}|${pageContext.interactiveElements?.length ?? 0}|${collectedCount}`;
+    if (progressDigest === lastProgressDigest) {
+      noProgressSteps++;
+    } else {
+      noProgressSteps = 0;
+      lastProgressDigest = progressDigest;
+    }
+    if (noProgressSteps >= NO_PROGRESS_SOFT && !replanned) {
+      replanned = true;
+      addLog(taskId, 'warn', `🧭 连续 ${noProgressSteps} 步页面无变化，重新规划并建议跳过受阻子目标`);
+      await replanInPlace(taskId, pageContext, '多步无页面进展');
+      actionCounts.clear();
+      thoughtCounts.clear();
+      noProgressSteps = 0;
+      correction = STUCK_SKIP_CORRECTION;
+      correctionTtl = 3;
+      persistGuards();
+      emit(taskId);
+      continue;
+    }
+    if (noProgressSteps >= NO_PROGRESS_HARD) {
+      task = updateTask(taskId, {
+        status: 'completed',
+        outcome: 'gave_up',
+        result:
+          (await finalizeResult(taskId)) +
+          '\n\n⚠️ 多步尝试后页面始终没有变化，判断当前目标在此页面无法继续（可能内容为空或位于无法读取的区域），已停止并给出已获得的部分结果。',
+        recordedSteps: recordWorkflowDraft(task),
+      });
+      addLog(taskId, 'warn', `🛑 连续 ${noProgressSteps} 步无进展，诚实停止（部分完成）`);
+      persistGuards();
+      emit(taskId);
+      break;
+    }
+
     let decision;
     try {
-      decision = await decideNextAction(task.userRequest, pageContext, buildHistory(task), task.plan, conversationContext, correction, progressBlock(task));
+      const screenshot = await captureScreenshotForVision(task);
+      decision = await decideNextAction(task.userRequest, pageContext, buildHistory(task), task.plan, conversationContext, correction, progressBlock(task), screenshot, task.attachments);
       decisionFailures = 0;
       // Keep a correction in effect for a couple of turns so the model actually
       // changes course, instead of clearing it after a single decision.
@@ -906,6 +1023,9 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
         },
       });
       addLog(taskId, 'warn', `需要确认高风险操作: ${action.tool}`);
+      // Persist counters BEFORE pausing: confirming re-enters runAgentLoop, which
+      // must resume with these guards intact (not reset to zero).
+      persistGuards();
       emit(taskId);
       break;
     }
@@ -975,6 +1095,7 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
     }
 
     task = updateTask(taskId, { currentStepIndex: task.currentStepIndex + 1 });
+    persistGuards();
     emit(taskId);
   }
 
@@ -1459,9 +1580,8 @@ export async function runWorkflow(
   const wf = getWorkflow(workflowId);
   if (!wf) throw new Error(`Workflow not found: ${workflowId}`);
 
-  const merged: Record<string, string> = {};
-  for (const p of wf.params) merged[p.key] = p.default ?? '';
-  Object.assign(merged, params);
+  // Resolve params (auto-generating 'generate'-mode values) before substitution.
+  const merged = await resolveParamValues(wf.params, params, { goalName: wf.name });
 
   const steps: PlanStep[] = wf.steps.map((step) => ({
     id: uuidv4(),
@@ -1528,6 +1648,9 @@ export async function continueTask(taskId: string): Promise<Task> {
     outcome: undefined,
     error: undefined,
     maxSteps: newMax,
+    // Continuing is a deliberate fresh attempt: reset the anti-flail guards so a
+    // task that previously gave up isn't instantly stopped again by stale counts.
+    guardState: undefined,
   });
   addLog(
     taskId,

@@ -3,7 +3,16 @@ import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
-import type { PageContext, RequestMode } from '@ai-browser-agent/shared';
+import type {
+  PageContext,
+  RequestMode,
+  TaskAttachment,
+  RecordedAction,
+  RecordingNarration,
+  WorkflowStep,
+  WorkflowParam,
+  WorkflowTrigger,
+} from '@ai-browser-agent/shared';
 import {
   createTask,
   getTask,
@@ -11,6 +20,7 @@ import {
   updateTask,
 } from './tasks/store.js';
 import {
+  addTaskToSession,
   appendUserMessage,
   recordAssistantTurn,
   listSessions,
@@ -25,8 +35,10 @@ import {
   getWorkflow,
   updateWorkflow,
   deleteWorkflow,
+  createWorkflow,
 } from './workflows/store.js';
-import { instantiateWorkflow, saveTaskAsWorkflow } from './workflows/service.js';
+import { instantiateWorkflow, saveTaskAsWorkflow, resolveParamValues } from './workflows/service.js';
+import { understandRecording, createReplayTaskFromSteps, editRecording } from './workflows/recording.js';
 import { redactedConfig, setRuntimeConfig } from './config/runtime-config.js';
 import { getDebugLogs, clearDebugLogs, ingestClientLogs } from './debug/logger.js';
 import {
@@ -39,7 +51,7 @@ import {
   continueTask,
   steerTask,
 } from './agent/orchestrator.js';
-import { describeLLM, suggestPageActions } from './llm/provider.js';
+import { describeLLM, suggestPageActions, refineVoiceInstructionWithLLM } from './llm/provider.js';
 import {
   handleWebSocketConnection,
   broadcastTaskUpdate,
@@ -85,6 +97,7 @@ app.post('/api/tasks', async (req, res) => {
       tabId,
       url,
       pageContext,
+      attachments,
       kind,
       requestMode,
       loopIntervalMs,
@@ -95,13 +108,14 @@ app.post('/api/tasks', async (req, res) => {
       tabId?: number;
       url?: string;
       pageContext?: PageContext;
+      attachments?: TaskAttachment[];
       kind?: 'once' | 'loop';
       requestMode?: RequestMode;
       loopIntervalMs?: number;
       loopMaxIterations?: number;
     };
 
-    if (!userRequest) {
+    if (!userRequest && !(attachments && attachments.length)) {
       return res.status(400).json({ error: 'userRequest is required' });
     }
 
@@ -110,17 +124,24 @@ app.post('/api/tasks', async (req, res) => {
       sessionId,
       tabId,
       url,
+      attachments,
       kind,
       requestMode,
       loopIntervalMs,
       loopMaxIterations,
     });
 
+    // Track the task on its session so history can replay the full run
+    // (plan + step-by-step operations + outcome), not just the chat thread.
+    addTaskToSession(sessionId, task.id, userRequest);
     appendUserMessage(sessionId, task.id, userRequest);
 
     if (pageContext) {
       updateTask(task.id, {
         checkpoint: { stepIndex: 0, pageContext, savedAt: Date.now() },
+        // Seed the stable start page from the page the task was launched on.
+        startUrl: task.startUrl ?? pageContext.url,
+        url: task.url ?? pageContext.url,
       });
     }
 
@@ -339,17 +360,152 @@ app.post('/api/workflows/:id/run', async (req, res) => {
   try {
     const workflow = getWorkflow(req.params.id);
     if (!workflow) return res.status(404).json({ error: 'Workflow not found' });
-    const { params, tabId, url } = req.body as {
+    const { params, tabId, url, loopIntervalMs } = req.body as {
       params?: Record<string, string>;
       tabId?: number;
       url?: string;
+      loopIntervalMs?: number;
     };
-    const task = instantiateWorkflow(workflow, params ?? {}, { tabId, url });
+    const resolved = await resolveParamValues(workflow.params, params ?? {}, {
+      goalName: workflow.name,
+    });
+    const task = instantiateWorkflow(workflow, resolved, { tabId, url, loopIntervalMs });
     runTask(task.id)
       .then((t) => {
         if (t.kind === 'loop' && t.loopIntervalMs) scheduleLoopTask(t.id, t.loopIntervalMs);
         broadcastTaskUpdate(t.id);
       })
+      .catch((err) => {
+        try {
+          updateTask(task.id, {
+            status: 'failed',
+            outcome: 'failed',
+            error: err instanceof Error ? err.message : String(err),
+          });
+        } catch {
+          /* ignore */
+        }
+        broadcastTaskUpdate(task.id);
+      });
+    res.status(201).json({ task });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// ---- Voice (speech transcript → concise instruction) ----
+
+app.post('/api/voice/refine', async (req, res) => {
+  try {
+    const { transcript } = req.body as { transcript?: string };
+    if (!transcript?.trim()) return res.status(400).json({ error: 'transcript is required' });
+    const instruction = await refineVoiceInstructionWithLLM(transcript);
+    res.json({ instruction });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// ---- Recordings (capture user actions → understand → workflow) ----
+
+app.post('/api/recordings/understand', async (req, res) => {
+  try {
+    const { actions, narration, pageContext } = req.body as {
+      actions?: RecordedAction[];
+      narration?: RecordingNarration[];
+      pageContext?: PageContext;
+    };
+    if (!Array.isArray(actions) || actions.length === 0) {
+      return res.status(400).json({ error: 'actions is required' });
+    }
+    const understood = await understandRecording(actions, narration, pageContext);
+    res.json(understood);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.post('/api/recordings/edit', async (req, res) => {
+  try {
+    const { name, steps, params, instruction, targetStepId, pageContext } = req.body as {
+      name?: string;
+      steps?: WorkflowStep[];
+      params?: WorkflowParam[];
+      instruction?: string;
+      targetStepId?: string;
+      pageContext?: PageContext;
+    };
+    if (!Array.isArray(steps) || steps.length === 0) {
+      return res.status(400).json({ error: 'steps is required' });
+    }
+    if (!instruction?.trim()) {
+      return res.status(400).json({ error: 'instruction is required' });
+    }
+    const edited = await editRecording(
+      { name: name?.trim() || '录制的工作流', steps, params: params ?? [] },
+      instruction.trim(),
+      { targetStepId, pageContext }
+    );
+    res.json(edited);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.post('/api/recordings/save', (req, res) => {
+  try {
+    const { name, description, steps, params, startUrl, triggers } = req.body as {
+      name?: string;
+      description?: string;
+      steps?: WorkflowStep[];
+      params?: WorkflowParam[];
+      startUrl?: string;
+      triggers?: WorkflowTrigger[];
+    };
+    if (!name?.trim()) return res.status(400).json({ error: 'name is required' });
+    if (!Array.isArray(steps) || steps.length === 0) {
+      return res.status(400).json({ error: 'steps is required' });
+    }
+    const workflow = createWorkflow({
+      name: name.trim(),
+      description,
+      startUrl,
+      params: params ?? [],
+      steps: steps.map((s) => ({ ...s, id: s.id || crypto.randomUUID() })),
+      triggers: triggers ?? [{ type: 'manual' }],
+    });
+    res.status(201).json({ workflow });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.post('/api/recordings/demo', async (req, res) => {
+  try {
+    const { name, steps, params, startUrl, tabId, url } = req.body as {
+      name?: string;
+      steps?: WorkflowStep[];
+      params?: WorkflowParam[];
+      startUrl?: string;
+      tabId?: number;
+      url?: string;
+    };
+    if (!Array.isArray(steps) || steps.length === 0) {
+      return res.status(400).json({ error: 'steps is required' });
+    }
+    // Resolve run-time values (auto-generate 'generate' params) so the demo
+    // exercises realistic values rather than empty placeholders.
+    const values = await resolveParamValues(params ?? [], {}, { goalName: name });
+    const task = createReplayTaskFromSteps(steps, {
+      name: name?.trim() || '录制演示',
+      startUrl,
+      tabId,
+      url,
+      params,
+      values,
+    });
+    runTask(task.id)
+      .then((t) => broadcastTaskUpdate(t.id))
       .catch((err) => {
         try {
           updateTask(task.id, {

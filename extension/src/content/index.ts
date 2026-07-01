@@ -1,6 +1,7 @@
 import { extractPageContext } from './page-context.js';
 import { executeBrowserTool } from './browser-tools.js';
 import { initFloatingUI } from './floating-ui.js';
+import { startRecording, stopRecording } from './recorder.js';
 
 type ContentMessage = {
   type: string;
@@ -40,6 +41,15 @@ if (!window.__AI_AGENT_CONTENT__) {
           return { ...result, pageContext };
         }
 
+        // Background broadcasts start/stop so recording follows the user across
+        // navigations (each page load re-injects this content script).
+        case 'RECORD_CONTROL': {
+          if (window.top !== window.self) return { ok: true };
+          if (message.args?.action === 'start') startRecording();
+          else stopRecording();
+          return { ok: true };
+        }
+
         default:
           return { success: false, error: `Unknown message type: ${message.type}` };
       }
@@ -59,6 +69,16 @@ if (!window.__AI_AGENT_CONTENT__) {
   // Let the background know a top-level page loaded (drives auto-run workflows).
   if (window.top === window.self) {
     chrome.runtime.sendMessage({ type: 'PAGE_LOADED', url: location.href }).catch(() => {});
+
+    // If a recording session is active, re-attach the capture listeners on this
+    // freshly loaded page. The navigation itself is recorded by the background on
+    // PAGE_LOADED, so we don't emit it here (avoids losing/duplicating it).
+    chrome.runtime
+      .sendMessage({ type: 'GET_RECORD_STATE' })
+      .then((state: { recording?: boolean } | undefined) => {
+        if (state?.recording) startRecording();
+      })
+      .catch(() => {});
   }
 
   console.log('[AI Browser Agent] Content script loaded');

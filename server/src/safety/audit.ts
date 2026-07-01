@@ -55,14 +55,52 @@ const SAFE_TOOLS = new Set([
 ]);
 
 /**
- * Genuinely destructive intents that should still pause for confirmation.
- * Deliberately tighter than DANGEROUS_KEYWORDS (which also flags benign words
- * like "post"/"send"/"submit" that routinely appear in URLs and link text).
+ * Genuinely destructive financial intents that should always pause. These are
+ * scanned even inside typed content because such words rarely appear there.
  */
 const CONFIRM_KEYWORDS = [
   'pay ', 'payment', 'checkout', 'place order', 'confirm order',
   'transfer', 'withdraw', 'credit card',
   '支付', '付款', '下单', '转账', '提现', '删除账户', '注销账户', '确认支付',
+];
+
+/**
+ * Verbs that signal a state-CHANGING commit: persisting, publishing, or deleting
+ * content (create / update / delete). Site-agnostic and multi-language. These are
+ * matched only against INTENT signals (the step rationale and the target
+ * selector/labels) — NOT against authored `text`/`value` content, so writing an
+ * article that merely mentions “保存” or “删除” never trips the gate.
+ */
+const MUTATION_KEYWORDS = [
+  'publish', 'unpublish', 'submit', 'save ', 'delete', 'remove', 'discard',
+  'overwrite', 'upload', 'archive', 'btnpublish', 'btnsave', 'btnsubmit', 'btndelete',
+  '发布', '发表', '提交', '保存', '删除', '移除', '丢弃', '覆盖', '上传', '归档', '下架', '存草稿',
+];
+
+/** State-changing HTTP methods (GET/HEAD/OPTIONS are safe reads). */
+const WRITE_HTTP_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+/**
+ * Signatures that show a piece of `evaluate` JS is WRITING / committing rather
+ * than just reading the page (which is the common, safe use of evaluate).
+ */
+const MUTATING_CODE_PATTERNS = [
+  /\.submit\s*\(/i,
+  /\.click\s*\(/i,
+  /\.value\s*=[^=]/i,
+  /\.innerHTML\s*=[^=]/i,
+  /\.innerText\s*=[^=]/i,
+  /\.textContent\s*=[^=]/i,
+  /\.checked\s*=[^=]/i,
+  /\.setValue\s*\(/i,
+  /dispatchEvent\s*\(/i,
+  /execCommand\s*\(/i,
+  /\.remove\s*\(\s*\)/i,
+  /removeChild/i,
+  /(local|session)Storage\.(setItem|removeItem|clear)/i,
+  /\bfetch\s*\(/i,
+  /XMLHttpRequest/i,
+  /sendBeacon/i,
 ];
 
 export function requiresConfirmation(
@@ -80,17 +118,49 @@ export function requiresConfirmation(
     return { required: false };
   }
 
-  // For action tools (click/type/...), only scan intent-bearing text — NOT
-  // url/selector/code/css/html — so navigating to a "/post/" URL or clicking a
-  // "下一页" link never trips a false positive. Only truly destructive intent
-  // (payment / money transfer) still asks for confirmation.
-  const SCAN_FIELDS = ['text', 'value', 'title', 'message'];
-  const argText = SCAN_FIELDS.map((k) => String((args as Record<string, unknown>)[k] ?? '')).join(' ');
-  const textToCheck = [stepDescription ?? '', argText].join(' ').toLowerCase();
+  // Network writes: any non-GET HTTP method can change server-side state.
+  if (tool === 'httpRequest') {
+    const method = String((args as Record<string, unknown>).method ?? 'GET').toUpperCase();
+    if (WRITE_HTTP_METHODS.has(method)) {
+      return { required: true, reason: `将发送 ${method} 请求（可能修改服务器数据），需要确认` };
+    }
+  }
 
+  // The evaluate escape hatch can do ANYTHING — gate it when the script writes
+  // state (submits a form, sets values, deletes nodes, POSTs, etc.). Read-only
+  // evaluate (querying/returning values) stays unconfirmed so exploration flows.
+  if (tool === 'evaluate') {
+    const code = String((args as Record<string, unknown>).code ?? '');
+    const codeLower = code.toLowerCase();
+    if (
+      MUTATING_CODE_PATTERNS.some((re) => re.test(code)) ||
+      MUTATION_KEYWORDS.some((kw) => codeLower.includes(kw.trim().toLowerCase()))
+    ) {
+      return { required: true, reason: '将通过脚本修改页面或提交数据，需要确认' };
+    }
+  }
+
+  // Intent scan for a commit/destructive action. Only look at the agent's stated
+  // rationale and the ACTION TARGET (selector + any button label/title) — never
+  // the authored `text`/`value`, so page content can't cause false positives.
+  const INTENT_FIELDS = ['selector', 'title', 'message'];
+  const intentText = [stepDescription ?? '', ...INTENT_FIELDS.map((k) => String((args as Record<string, unknown>)[k] ?? ''))]
+    .join(' ')
+    .toLowerCase();
+  for (const kw of MUTATION_KEYWORDS) {
+    if (intentText.includes(kw.trim().toLowerCase())) {
+      return { required: true, reason: `可能新增/修改/删除内容的操作（${kw.trim()}）需要确认` };
+    }
+  }
+
+  // Financial/destructive keywords: scan intent AND content (rare there anyway).
+  const CONTENT_FIELDS = ['text', 'value', 'title', 'message'];
+  const contentText = [stepDescription ?? '', ...CONTENT_FIELDS.map((k) => String((args as Record<string, unknown>)[k] ?? ''))]
+    .join(' ')
+    .toLowerCase();
   for (const kw of CONFIRM_KEYWORDS) {
-    if (textToCheck.includes(kw)) {
-      return { required: true, reason: `高风险操作（${kw}）需要确认` };
+    if (contentText.includes(kw)) {
+      return { required: true, reason: `高风险操作（${kw.trim()}）需要确认` };
     }
   }
 

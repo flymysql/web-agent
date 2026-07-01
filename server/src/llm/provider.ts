@@ -1,4 +1,13 @@
-import type { PlanStep, TaskPlan, PageContext } from '@ai-browser-agent/shared';
+import type {
+  PlanStep,
+  TaskPlan,
+  PageContext,
+  TaskAttachment,
+  RecordedAction,
+  WorkflowStep,
+  WorkflowParam,
+  WorkflowParamMode,
+} from '@ai-browser-agent/shared';
 import { getToolDefinition, ALL_TOOLS } from '@ai-browser-agent/shared';
 import { summarizePageContext } from '../tools/registry.js';
 import { getRuntimeConfig } from '../config/runtime-config.js';
@@ -33,9 +42,73 @@ export interface AgentDecision {
   question?: string;
 }
 
+/** OpenAI-compatible multimodal content parts (used only when vision is on). */
+type ContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string; detail?: 'low' | 'high' | 'auto' } };
+
 interface LLMMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  content: string | ContentPart[];
+}
+
+/** Character length of a message's content for logging (text parts only). */
+function contentChars(content: string | ContentPart[]): number {
+  if (typeof content === 'string') return content.length;
+  return content.reduce((n, p) => n + (p.type === 'text' ? p.text.length : 0), 0);
+}
+
+/**
+ * Vision is an OPTIONAL, pluggable layer. It stays fully off unless LLM_VISION
+ * is truthy AND the configured model can see images. When off, every code path
+ * behaves exactly as the text-only pipeline did.
+ */
+export function isVisionEnabled(): boolean {
+  const v = (process.env.LLM_VISION ?? '').toLowerCase();
+  return v === '1' || v === 'true' || v === 'on' || v === 'yes';
+}
+
+function visionDetail(): 'low' | 'high' | 'auto' {
+  const d = (process.env.LLM_VISION_DETAIL ?? 'low').toLowerCase();
+  return d === 'high' || d === 'auto' ? d : 'low';
+}
+
+/**
+ * Build a user message body: plain text by default; when vision is enabled and
+ * one or more image dataURLs are supplied (viewport screenshot and/or attached
+ * images), attach them as image parts (low detail = server-side downsampling,
+ * keeping cost/latency bounded).
+ */
+function buildUserContent(text: string, images?: Array<string | undefined>): string | ContentPart[] {
+  const imgs = (images ?? []).filter((u): u is string => typeof u === 'string' && u.startsWith('data:'));
+  if (imgs.length === 0 || !isVisionEnabled()) return text;
+  return [
+    { type: 'text', text },
+    ...imgs.map<ContentPart>((url) => ({ type: 'image_url', image_url: { url, detail: visionDetail() } })),
+  ];
+}
+
+/**
+ * Turn user-attached files into extra model input. Text files become a labelled
+ * text block; images either flow to the vision channel (when enabled) or are
+ * noted by name so the model knows they exist but can't be read.
+ */
+function summarizeAttachments(attachments?: TaskAttachment[]): { textBlock: string; images: string[] } {
+  if (!attachments || attachments.length === 0) return { textBlock: '', images: [] };
+  const parts: string[] = [];
+  const images: string[] = [];
+  for (const a of attachments) {
+    if (a.kind === 'text' && a.text) {
+      parts.push(`【${a.name}】\n${a.text}`);
+    } else if (a.kind === 'image') {
+      if (isVisionEnabled() && a.dataUrl) images.push(a.dataUrl);
+      else parts.push(`[图片: ${a.name}]（未开启视觉，无法读取图片内容）`);
+    }
+  }
+  const textBlock = parts.length
+    ? `USER FILES（用户附加的文件，作为输入的一部分）:\n${parts.join('\n\n')}`
+    : '';
+  return { textBlock, images };
 }
 
 /**
@@ -220,13 +293,14 @@ async function chatCompletion(
   const effMaxTokens = opts.maxTokens ?? maxTokens;
   const maxRetries = parseInt(process.env.LLM_MAX_RETRIES ?? '3', 10);
 
-  const promptChars = messages.reduce((n, m) => n + m.content.length, 0);
+  const promptChars = messages.reduce((n, m) => n + contentChars(m.content), 0);
+  const systemPreview = typeof messages[0]?.content === 'string' ? messages[0].content.slice(0, 300) : undefined;
   debugLog({
     source: 'llm',
     level: 'info',
     category: `${label}.request`,
     message: `→ ${model} (${messages.length} msgs, ${promptChars} chars)`,
-    data: { baseUrl, model, maxTokens, system: messages[0]?.content?.slice(0, 300) },
+    data: { baseUrl, model, maxTokens, system: systemPreview },
   });
 
   let res: Response | undefined;
@@ -459,21 +533,28 @@ Output ONLY valid JSON in this format:
 export async function generatePlanWithLLM(
   userRequest: string,
   pageContext?: PageContext,
-  conversationContext?: string
+  conversationContext?: string,
+  attachments?: TaskAttachment[]
 ): Promise<TaskPlan> {
   const pageSummary = pageContext
-    ? `Page: ${pageContext.title}\nURL: ${pageContext.url}\nLinks: ${pageContext.links.length}\nForms: ${pageContext.formFields.length}\nText preview: ${pageContext.visibleText.slice(0, 1000)}`
+    ? summarizePageContext(pageContext, { maxTextChars: 1000 })
     : 'No page context available';
 
   const historyBlock = conversationContext
     ? `\n\n会话历史(此前任务与结果,供参考延续上下文):\n${conversationContext}`
     : '';
 
+  const { textBlock, images } = summarizeAttachments(attachments);
+  const filesBlock = textBlock ? `\n\n${textBlock}` : '';
+
   const messages: LLMMessage[] = [
     { role: 'system', content: PLANNER_SYSTEM_PROMPT },
     {
       role: 'user',
-      content: `${currentDateTimeNote()}\n\nRequest: ${userRequest}${historyBlock}\n\n${pageSummary}`,
+      content: buildUserContent(
+        `${currentDateTimeNote()}\n\nRequest: ${userRequest}${filesBlock}${historyBlock}\n\n${pageSummary}`,
+        images
+      ),
     },
   ];
 
@@ -524,22 +605,32 @@ const ROUTER_SYSTEM_PROMPT = `You are the intent router for a browser assistant 
 Classify the user's latest message into exactly one of:
 - "chat": the user is chatting, greeting, or asking a QUESTION you can answer directly (what can you do, explain this page, general knowledge, summarize the visible content). No page actions are needed. Put a concise, helpful Chinese reply in "answer".
 - "agent": the user wants you to DO something in the browser (navigate, click, fill a form, extract+process data, automate a flow, change the page, multi-page collection). Put a concise actionable goal in "goal".
-- "clarify": it IS a task, but it is underspecified or cannot be inferred from the current page (missing target, ambiguous object, needs info you do not have). Put ONE short Chinese question in "question".
-Prefer "chat" for meta/conversational questions ("你能做什么", "这页讲了啥"). Prefer "clarify" over guessing and flailing when a task lacks a concrete target on this page.
+- "clarify": it IS a task, but the user's GOAL itself is genuinely ambiguous (you can't tell what outcome they want), NOT merely that some data isn't visible yet. Put ONE short Chinese question in "question".
+Prefer "chat" for meta/conversational questions ("你能做什么", "这页讲了啥").
+IMPORTANT — do NOT clarify just because the info isn't on screen yet. The page context below is only a snapshot; the agent can expand panels, add columns/fields, scroll, switch views, open detail pages, and read more. If the goal is clear but the needed data might be reachable by interacting with the page (the PAGE REGIONS list shows what blocks/controls exist), choose "agent" and let it explore — do NOT ask the user to do the clicking. Reserve "clarify" for when the target/intent is truly undecidable.
 Respond ONLY with JSON: { "kind": "chat"|"agent"|"clarify", "answer"?: "...", "question"?: "...", "goal"?: "..." }`;
 
 export async function routeIntent(
   userRequest: string,
   pageContext?: PageContext,
-  conversationContext?: string
+  conversationContext?: string,
+  attachments?: TaskAttachment[]
 ): Promise<IntentResult> {
   const pageSummary = pageContext
-    ? `Page: ${pageContext.title}\nURL: ${pageContext.url}\nText preview: ${pageContext.visibleText.slice(0, 800)}`
+    ? summarizePageContext(pageContext, { maxTextChars: 800 })
     : 'No page context available';
   const historyBlock = conversationContext ? `\n\n对话历史:\n${conversationContext.slice(0, 1000)}` : '';
+  const { textBlock, images } = summarizeAttachments(attachments);
+  const filesBlock = textBlock ? `\n\n${textBlock}` : '';
   const messages: LLMMessage[] = [
     { role: 'system', content: ROUTER_SYSTEM_PROMPT },
-    { role: 'user', content: `${currentDateTimeNote()}\n\n用户消息: ${userRequest}${historyBlock}\n\n${pageSummary}` },
+    {
+      role: 'user',
+      content: buildUserContent(
+        `${currentDateTimeNote()}\n\n用户消息: ${userRequest}${filesBlock}${historyBlock}\n\n${pageSummary}`,
+        images
+      ),
+    },
   ];
   const content = await chatCompletion(messages, 'router', { maxTokens: 800 });
   const parsed = parseJsonLoose<IntentResult>(content, 'the intent');
@@ -555,15 +646,24 @@ export async function answerChat(
   userRequest: string,
   pageContext?: PageContext,
   conversationContext?: string,
-  onDelta?: (delta: string) => void
+  onDelta?: (delta: string) => void,
+  attachments?: TaskAttachment[]
 ): Promise<string> {
   const pageSummary = pageContext
     ? `当前页面: ${pageContext.title} (${pageContext.url})\n可见内容预览:\n${pageContext.visibleText.slice(0, 1500)}`
     : '(无页面上下文)';
   const historyBlock = conversationContext ? `\n\n对话历史:\n${conversationContext.slice(0, 1200)}` : '';
+  const { textBlock, images } = summarizeAttachments(attachments);
+  const filesBlock = textBlock ? `\n\n${textBlock}` : '';
   const messages: LLMMessage[] = [
     { role: 'system', content: CHAT_SYSTEM_PROMPT },
-    { role: 'user', content: `${currentDateTimeNote()}\n\n${userRequest}${historyBlock}\n\n${pageSummary}` },
+    {
+      role: 'user',
+      content: buildUserContent(
+        `${currentDateTimeNote()}\n\n${userRequest}${filesBlock}${historyBlock}\n\n${pageSummary}`,
+        images
+      ),
+    },
   ];
   if (onDelta) {
     return streamChatCompletion(messages, 'chat', onDelta);
@@ -575,7 +675,7 @@ const SUGGEST_SYSTEM_PROMPT = `你是网页智能助手。根据用户当前所�
 要求：
 - 必须贴合该页面的实际内容与功能（结合标题、URL、可见文本、可交互元素来判断这是什么页面、能做什么），不要给放之四海皆准的空话。
 - label：给用户看的简短中文按钮文字（≤12 字）；prompt：点击后填入输入框的完整中文指令（清晰、可直接执行）。
-- 优先具体、有价值的操作（例如「触发 build 工作流」「总结这篇文档要点」「导出这张表格」「帮我填写并提交这个表单」「翻页采集全部条目」），避免雷同与空泛。
+- 优先具体、有价值的操作（例如「总结这篇文档要点」「导出这张表格」「帮我填写并提交这个表单」「翻页采集全部条目」），避免雷同与空泛。
 - 只输出 JSON：{"suggestions":[{"label":"…","prompt":"…"}]}。`;
 
 /**
@@ -620,28 +720,30 @@ const AGENT_SYSTEM_PROMPT = `You are a web automation agent operating one step a
 Given the GOAL, the CURRENT PAGE, and the HISTORY of actions already taken, decide the SINGLE next action.
 Available tools:
 ${TOOLS_BRIEF}
-Selectors should come from the current page's interactive elements (use their selector field).
-SELECTOR STRATEGY: prefer the el-N ids and selectors listed under INTERACTIVE ELEMENTS. When you want an element by its visible label and don't have a clean CSS path, you MAY use text matching: text=Run workflow or button:has-text('Run workflow') (these ARE supported). Do NOT keep retrying combinator/sibling guesses like a:has-text('x') ~ button. Never repeat a selector that just failed — switch to a text selector or a different listed element.
+READ THE PAGE STRUCTURE FIRST: the CURRENT PAGE section gives you a Heading outline and a "Page regions" list — each region is a semantic block ([navigation]/[search]/[form]/[dialog]/[list]/[table]/[toolbar]/…) with its label and the key controls inside it (shown as "selector → label [tag/role] (state)"). Use this to understand what each block is FOR and which control does what, then pick the right control for the GOAL. States like (collapsed)/(expanded) tell you a panel/menu can be opened; (disabled) means it can't be used yet.
+MODAL FOCUS: if a region is marked "(modal, on top)" or the page flags a 置顶弹窗/对话框, operate INSIDE that dialog (or close it first) — do not act on the background behind it.
+Selectors should come from the current page's regions/controls (use their selector field).
+SELECTOR STRATEGY: prefer the el-N ids and the selectors listed under Page regions. When you want an element by its visible label and don't have a clean CSS path, you MAY use text matching: text=<label> or tag:has-text('<label>') (these ARE supported). Do NOT keep retrying combinator/sibling guesses like a:has-text('x') ~ button. Never repeat a selector that just failed — switch to a text selector or a different listed control.
 ANTI-LOOP: if clicking a link sends you to the wrong page and you navigate back only to click it again, STOP — that link is not the path to the goal. Pick a different element on the current page, or use needsInput to ask the user.
-The CURRENT PAGE section below is ALWAYS refreshed for you before every decision — you can already see the page's text, links and interactive elements. Therefore NEVER call extractPage/observe just to "read" or "get" the page; that wastes a step. Act directly (click a specific link, navigate, type, etc.) or finish with done.
+The CURRENT PAGE section below is ALWAYS refreshed for you before every decision — you can already see the page's structure, text and controls. Therefore NEVER call extractPage/observe just to "read" or "get" the page; that wastes a step. Act directly (click a specific control, navigate, type, expand a collapsed panel, etc.) or finish with done.
+EXPLORE BEFORE ASKING: if the data the GOAL needs isn't visible yet but a region/control could reveal it (an expandable panel, an "add field/column" control, a filter, a different tab/view, or a row's detail page), DO that action yourself instead of asking the user to click. Only ask the user when the GOAL itself is ambiguous — never as a substitute for exploring the page.
 The plan is only a rough hint — adapt freely to what the page actually shows. If reality differs from the plan, change course to reach the GOAL instead of following the plan literally.
 Do NOT repeat an action that already failed or produced no progress; try a DIFFERENT selector, link, or tool. If you already have the information the goal needs, set done=true and put the answer in "summary".
 For a multi-item goal (e.g. "summarize every article in a series", OR "for each order list the buyer name & address"): first gather the list of item URLs from the current page, then DELEGATE one item at a time, ALWAYS passing the url: delegate({"url":"/post/123/","title":"...","goal":"summarize this article"}). Each result is stored automatically and shown to you under "进度". NEVER re-delegate an item already listed there, and do NOT open/read items yourself — let sub-agents do it. When every item is collected, simply set done=true; the system AUTO-SYNTHESIZES all collected items into the final answer, so you do NOT need to write the combined summary yourself.
 CRAWL VIA LINKS (very important): if the GOAL needs a field (buyer name, address, price, phone, status, detail text…) that is NOT present on the current list/index page, do NOT keep re-running evaluate/getHTML on the list hoping it appears — it won't. The data lives on each row's DETAIL page. Collect each row's detail link (from the page's links/interactive elements, or read the row's <a href>), then DELEGATE one row at a time with that url and a goal like "extract the buyer name and shipping address from this order". The sub-agent opens the detail page, extracts the fields, and the result is stored + auto-synthesized. If a row has no obvious link, click into the first row to learn the detail-URL pattern, then delegate the rest by url. Treat "evaluate returned empty/!found twice" as the signal to switch to this crawl-by-detail-page approach instead of repeating it.
 Open a different page with navigate (do not guess URLs into clicks). After any action that triggers loading, use wait (selector/text/urlIncludes) before reading the result. Before declaring done, use expect to verify the goal actually holds.
-GITHUB ACTIONS — to MANUALLY run a workflow: the trigger button only exists on the workflow's definition page https://github.com/<owner>/<repo>/actions/workflows/<file>.yml — NOT on a run page (/actions/runs/<id> only offers "Re-run jobs"). If you land on a /actions/runs/… page you clicked a run entry by mistake; navigate to the .yml URL or click the workflow's name in the LEFT sidebar (its link is a[href*='/actions/workflows/']) instead of a text= match (which also matches run titles). On the workflow page, "Run workflow" is a DROPDOWN: first click the dropdown toggle (button:has-text('Run workflow') or summary), then in the panel click the green submit button (button[type=submit] with text "Run workflow"). github.com blocks evaluate via CSP — never use evaluate there; use clicks / getHTML instead.
 If the goal is genuinely underspecified or the needed target/info simply is not reachable from the pages you can see (so continuing would just be blind guessing), STOP and ASK the user ONE concise question instead of clicking around randomly.
-BUT ask sparingly and never as a stall: BEFORE using needsInput, check the conversation history AND the current page — if the answer (or a sensible default) is already inferable, just USE it and proceed, briefly stating the assumption you made. For informational/"how do I write X" questions, prefer giving a concrete answer with the value filled in (note any assumption) over asking for an exact token. Map obvious user inputs yourself (e.g. a city name like "深圳" → the value "shenzhen" that already appears in the page/path; "上海" → "shanghai"). NEVER re-ask a question the user has already effectively answered in the thread — adopt their reply and continue; asking the same thing twice is a bug.
+BUT ask sparingly and never as a stall: BEFORE using needsInput, check the conversation history AND the current page — if the answer (or a sensible default) is already inferable, just USE it and proceed, briefly stating the assumption you made. For informational/"how do I write X" questions, prefer giving a concrete answer with the value filled in (note any assumption) over asking for an exact token. Map obvious user inputs yourself to the corresponding value/token that already appears on the page or in the URL/path, instead of asking for the exact literal. NEVER re-ask a question the user has already effectively answered in the thread — adopt their reply and continue; asking the same thing twice is a bug.
 DATE/TIME: the user message starts with 『当前日期时间』 — that is the real current local date/time. Always use it for any "今天/昨天/本周/最近" reasoning (e.g. filling a date filter with today's date). NEVER guess or hallucinate the current date.
-DATE RANGE FILTERS: when filtering by a single day (e.g. "今天的订单"), a date range needs a real span — set the START to that day 00:00:00 and the END to that day 23:59:59 (or the next day 00:00:00). NEVER set start and end to the SAME instant (e.g. both 2026-06-30 00:00:00) — a zero-width range matches nothing and returns 0 results. If a "today" filter returns 0 but the page clearly shows recent orders, suspect the range/time-of-day is wrong and fix the end bound before concluding there are no orders.
+SANITY-CHECK RESULTS: if an action's result contradicts what the page plainly shows (e.g. a filter/query returns 0 while matching rows are clearly listed, or a control seems to do nothing), suspect your inputs/parameters are wrong and fix them — don't conclude "empty/impossible" or repeat the same action. Prefer analysing data that is ALREADY on the page over navigating elsewhere to look for an equivalent view; if a view you expected doesn't exist, stop searching for it and work with what's available.
+COMMIT SAFELY: actions that PERSIST changes — publish, save, submit a form, delete, or any create/update/delete — are hard to undo for the user and WILL PAUSE for the user's confirmation before running. So prepare EVERYTHING first (fill all fields / write the full content), then do the single commit ONCE; do not repeatedly poke publish/save. When the GOAL is to CREATE something NEW, use the site's own "new / create / add / ＋" affordance (or a blank create URL) — do NOT open and overwrite an EXISTING item, because editing an existing entry replaces the user's data. If you can't find a create affordance (or aren't sure which item is safe to touch), ask the user instead of reusing an existing one.
 EVALUATE: keep evaluate code SHORT, self-contained, and syntactically valid, and make the LAST expression the value you want back (e.g. JSON.stringify(result)). If an evaluate throws a syntax/parse error ("Unexpected token …") or returns empty twice, do NOT resend the same code — simplify it, or read the data from the already-provided page text/interactive elements instead. Often the data you need to count/sum is already visible in CURRENT PAGE; prefer reading it over fragile DOM scraping.
 Respond ONLY with valid JSON, one of:
 { "thought": "one short sentence (≤25 words)", "done": false, "action": { "tool": "toolName", "args": { } } }
 { "thought": "why finished", "done": true, "summary": "what was accomplished" }
 { "thought": "why blocked", "needsInput": true, "question": "你想…?（用中文问一个具体问题）" }
-You have FULL power to modify the page yourself — do NOT tell the user to open the console or do it manually. For theming / colors / dark mode, STRONGLY prefer a single injectCSS call with grouped CSS rules that target many elements at once (one rule can cover buttons, links, inputs, etc.) instead of many per-element setStyle calls.
-DARK MODE — do it the safe way: the most reliable, never-breaks-text dark theme is a root filter, e.g. injectCSS({"id":"theme","css":"html{background:#fff!important;filter:invert(0.92) hue-rotate(180deg)!important} img,video,picture,canvas,svg,[style*=\\"background-image\\"]{filter:invert(1) hue-rotate(180deg)!important}"}). NEVER write "* { background/color !important }" or set background AND color to the same family on a universal selector — that makes text the same colour as its background and the page goes blank. ALWAYS pass a stable id like "theme" to injectCSS so re-applying replaces the previous block instead of stacking.
-RECOVERY — if the user says text/content disappeared, the page is blank, or your styling looks broken: do NOT layer on more CSS. FIRST call clearInjectedCSS (no args) to remove everything you injected and restore the original page, then if needed re-apply a corrected, safer version. If two attempts at a visual change don't satisfy the user, clearInjectedCSS and ask them what they want instead of guessing again.
+You have FULL power to modify the page yourself — do NOT tell the user to open the console or do it manually. When restyling, prefer a single injectCSS call with grouped rules (one rule can cover many elements) over many per-element setStyle calls, and ALWAYS pass a stable id so re-applying REPLACES the previous block instead of stacking.
+RECOVERY — if a change you made breaks the page (content disappears, blank, looks wrong): do NOT layer on more of the same. FIRST undo it (e.g. clearInjectedCSS with no args to remove everything you injected), then re-apply a corrected version. If two attempts don't satisfy the user, undo and ask what they want instead of guessing again.
 Keep each injectCSS payload focused and not excessively long; if a theme needs a lot of CSS, split it across a few injectCSS calls rather than one giant string (huge JSON values can get truncated). Use setStyle/setText/setHTML/setAttribute/removeElement only for targeted one-off DOM changes; use getHTML to inspect structure; and use evaluate to run arbitrary JavaScript as a last resort. Prefer the most specific tool and actually perform the task. To access the internet use webSearch (find pages/info), imageSearch (returns DIRECT image URLs for pictures), or httpRequest (call any HTTP API) — these run through the browser and have network access. To put a picture on the page, FIRST call imageSearch to get a real working image URL, THEN injectCSS with background-image:url(...) — never invent image URLs. ALL network access MUST go through these browser tools — there is NO server-side fetch.
 Set done=true when the goal is achieved, or when it cannot proceed. Avoid repeating a failed action; try an alternative. Keep your "thought" to ONE concise sentence — do not write long explanations.`;
 
@@ -652,7 +754,11 @@ export async function decideNextAction(
   planHint?: TaskPlan,
   conversationContext?: string,
   correction?: string,
-  progress?: string
+  progress?: string,
+  /** Optional viewport screenshot (dataURL); only used when LLM_VISION is on. */
+  screenshot?: string,
+  /** Files the user attached to the task (text merged into prompt, images to vision). */
+  attachments?: TaskAttachment[]
 ): Promise<AgentDecision> {
   const shown = history.slice(-HISTORY_WINDOW);
   const omitted = history.length - shown.length;
@@ -678,15 +784,12 @@ export async function decideNextAction(
     ? `\n\n会话历史(此前任务与结果):\n${conversationContext.slice(0, 800)}`
     : '';
 
+  const { textBlock, images: attachImages } = summarizeAttachments(attachments);
+  const filesBlock = textBlock ? `\n\n${textBlock}` : '';
+  const userText = `${currentDateTimeNote()}\n\nGOAL: ${goal}${hint}${ctxBlock}${filesBlock}${progress ? `\n\n进度（以下条目已采集完成，切勿重复处理）：\n${progress}` : ''}\n\nCURRENT PAGE:\n${summarizePageContext(pageContext, { withSelectors: true })}\n\nHISTORY:\n${historyText}${correction ? `\n\n⚠️ 重要提醒：${correction}` : ''}`;
   const messages: LLMMessage[] = [
     { role: 'system', content: AGENT_SYSTEM_PROMPT },
-    {
-      role: 'user',
-      content: `${currentDateTimeNote()}\n\nGOAL: ${goal}${hint}${ctxBlock}${progress ? `\n\n进度（以下条目已采集完成，切勿重复处理）：\n${progress}` : ''}\n\nCURRENT PAGE:\n${summarizePageContext(pageContext)}\n\nINTERACTIVE ELEMENTS (selector → text):\n${pageContext.interactiveElements
-        .slice(0, 25)
-        .map((el) => `${el.selector} → ${el.tag}${el.type ? `[${el.type}]` : ''} ${(el.text ?? el.placeholder ?? el.name ?? '').slice(0, 60)}`)
-        .join('\n')}\n\nHISTORY:\n${historyText}${correction ? `\n\n⚠️ 重要提醒：${correction}` : ''}`,
-    },
+    { role: 'user', content: buildUserContent(userText, [screenshot, ...attachImages]) },
   ];
 
   // A per-step decision is a short JSON (a thought + one action). Cap the output
@@ -730,4 +833,299 @@ export async function generateSummaryWithLLM(
     },
   ];
   return chatCompletion(messages, 'synthesis', { jsonMode: false });
+}
+
+export interface UnderstoodRecording {
+  name: string;
+  steps: WorkflowStep[];
+  params: WorkflowParam[];
+}
+
+/** Turn a captured RecordedAction into a literal WorkflowStep (fallback + prompt input). */
+function actionToLiteralStep(a: RecordedAction): WorkflowStep {
+  const def = getToolDefinition(a.tool);
+  const label = a.label ? `“${a.label}”` : (a.selector ?? '');
+  let description: string;
+  switch (a.tool) {
+    case 'click': description = `点击 ${label}`; break;
+    case 'type': description = `在 ${label} 输入文本`; break;
+    case 'selectOption': description = `在 ${label} 选择选项`; break;
+    case 'setChecked': description = `勾选/取消勾选 ${label}`; break;
+    case 'pressKey': description = `在 ${label} 按下 ${String(a.args.key ?? '')}`; break;
+    case 'navigate': description = `打开页面 ${String(a.args.url ?? '')}`; break;
+    default: description = `${a.tool} ${label}`.trim();
+  }
+  return {
+    id: '',
+    description,
+    tool: a.tool,
+    args: a.args,
+    riskLevel: def?.riskLevel ?? 'low',
+    requiresConfirmation: def?.requiresConfirmation ?? false,
+  };
+}
+
+const RECORDING_SYSTEM_PROMPT = `你会把用户在浏览器里的一段“录制操作”整理成一个干净、最小、可复用的工作流。
+输入是按时间顺序捕获的动作列表（每个含 tool、args、目标元素的可读 label、当时的页面 url，以及可选的 note——用户录制时口述的旁白/对 agent 的指导）。
+规则：
+- 输出忠实还原用户意图的有序步骤，去掉冗余/无效动作，把同一输入框的多次输入合并为最终值，删除仅仅是某次点击直接导致的重复 navigate。
+- 每个步骤的 "tool" 必须是以下之一：${TOOL_NAMES}。保持 args 里的 selector 原样不变。
+- 为每个步骤写一句简短的中文 "description"（这一步达成了什么），不要写与具体站点绑定的套话。若该步骤带 note，用它帮助你更准确地描述意图（note 是提示，不要逐字照抄）。
+- 找出用户“输入/选择”的、属于本任务可变输入的值（如搜索词、姓名、日期、数量），在 args 中用 {{占位符}} 替换它们，并在 "params" 里列出。key 用通用的 snake_case，例如 {{query}}、{{keyword}}、{{start_date}}；不要编造站点名。
+- 参数取值方式 "mode"：默认 "prompt"（每次运行用 default 或询问）。若某步骤的 note 表达了“这里每次内容不同 / 让 agent 自动生成 / 随机 / 用当天日期”等动态意图，则把该值参数化并设 mode="generate"，并在 "instruction" 用中文写清如何生成；default 仍填用户这次的原始值（用于演示复现）。
+- 结构性步骤与 selector 保持原样，只参数化“人工输入的值”。
+只输出 JSON：{ "name": "...", "steps": [ { "description": "...", "tool": "...", "args": {...} } ], "params": [ { "key": "...", "label": "...", "mode": "prompt|generate|constant", "instruction": "...", "default": "..." } ] }`;
+
+/**
+ * The "understand" pass: given raw recorded actions, ask the LLM to produce a
+ * clean, minimal, parameterized workflow. Fully site-agnostic. Falls back to a
+ * literal 1:1 mapping when the LLM is unavailable or returns nothing usable.
+ */
+export async function generalizeRecordingWithLLM(
+  actions: RecordedAction[],
+  pageContext?: PageContext
+): Promise<UnderstoodRecording> {
+  const literal = actions.map(actionToLiteralStep).map((s) => ({ ...s, id: crypto.randomUUID() }));
+  const fallbackName = `录制的工作流 · ${new Date().toLocaleString()}`;
+  const fallback: UnderstoodRecording = { name: fallbackName, steps: literal, params: [] };
+
+  if (!actions.length) return fallback;
+
+  try {
+    const compact = actions.slice(0, 80).map((a) => ({
+      tool: a.tool,
+      args: a.args,
+      label: a.label,
+      url: a.url,
+      ...(a.note ? { note: a.note } : {}),
+    }));
+    const pageSummary = pageContext ? summarizePageContext(pageContext, { maxTextChars: 500 }) : '';
+    const messages: LLMMessage[] = [
+      { role: 'system', content: RECORDING_SYSTEM_PROMPT },
+      {
+        role: 'user',
+        content: `${currentDateTimeNote()}\n\n录制的动作（共 ${actions.length} 个）：\n${JSON.stringify(
+          compact,
+          null,
+          2
+        )}${pageSummary ? `\n\n起始页面参考：\n${pageSummary}` : ''}`,
+      },
+    ];
+    const content = await chatCompletion(messages, 'recording', { maxTokens: 2000 });
+    const parsed = parseJsonLoose<{
+      name?: string;
+      steps?: Array<{ description?: string; tool?: string; args?: Record<string, unknown> }>;
+      params?: Array<{ key?: string; label?: string; mode?: string; instruction?: string; default?: string }>;
+    }>(content, 'the recording');
+
+    const steps: WorkflowStep[] = (parsed.steps ?? [])
+      .filter((s) => s.tool && getToolDefinition(s.tool))
+      .map((s) => {
+        const def = getToolDefinition(s.tool as string);
+        return {
+          id: crypto.randomUUID(),
+          description: s.description ?? s.tool ?? '',
+          tool: s.tool as string,
+          args: s.args ?? {},
+          riskLevel: def?.riskLevel ?? 'low',
+          requiresConfirmation: def?.requiresConfirmation ?? false,
+        };
+      });
+
+    if (!steps.length) return fallback;
+
+    const normMode = (m?: string): WorkflowParamMode =>
+      m === 'generate' || m === 'constant' ? m : 'prompt';
+    const params: WorkflowParam[] = (parsed.params ?? [])
+      .filter(
+        (p): p is { key: string; label?: string; mode?: string; instruction?: string; default?: string } =>
+          Boolean(p.key)
+      )
+      .map((p) => ({
+        key: p.key,
+        label: p.label ?? p.key,
+        mode: normMode(p.mode),
+        instruction: p.instruction,
+        default: p.default,
+      }));
+
+    return { name: parsed.name?.trim() || fallbackName, steps, params };
+  } catch (err) {
+    debugLog({
+      source: 'llm',
+      level: 'warn',
+      category: 'recording.fallback',
+      message: `录制理解失败，改用原样步骤：${err instanceof Error ? err.message : String(err)}`,
+    });
+    return fallback;
+  }
+}
+
+export interface EditableRecording {
+  name: string;
+  steps: WorkflowStep[];
+  params: WorkflowParam[];
+}
+
+const RECORDING_EDIT_SYSTEM_PROMPT = `你是浏览器工作流编辑器。给你一个由用户录制生成的工作流（名称 + 有序步骤 + 参数），以及一条用户的自然语言修改指令。请根据指令返回修改后的【完整】工作流。
+你可以做的修改：
+- 修改某一步的 description 或 args（如改选择器、改输入文本、改 URL）。
+- 新增 / 删除 / 重新排序步骤。每步的 "tool" 必须是以下合法工具之一：${TOOL_NAMES}。默认保持已有 selector 不变，除非用户明确要求更改。
+- 把“每次运行内容不固定”的值改成动态值：把对应 arg 的值替换成 {{key}} 占位符，并在 params 里给出该参数：
+  - mode="prompt"：每次运行让用户填写（可用 default 作为默认值）。
+  - mode="generate"：每次运行自动生成，instruction 用中文写清“如何生成这个值”（例如“生成一个随机测试邮箱”“用今天的日期，格式 YYYY-MM-DD”）。
+  - mode="constant"：固定值，写在 default。
+- key 用通用 snake_case（如 {{query}}、{{upload_content}}、{{today}}），不要编造具体站点名或标签。
+- params 必须覆盖 steps 里出现的所有 {{占位符}}；已不再使用的参数请删除。
+只输出 JSON：{ "name": "...", "steps": [ { "description": "...", "tool": "...", "args": {...} } ], "params": [ { "key": "...", "label": "...", "mode": "prompt|generate|constant", "instruction": "...", "default": "..." } ] }`;
+
+/** Apply a natural-language edit to a recorded/edited workflow. Returns the full updated triple. */
+export async function editRecordingWithLLM(
+  current: EditableRecording,
+  instruction: string,
+  opts: { targetStepId?: string; pageContext?: PageContext } = {}
+): Promise<EditableRecording> {
+  const compactSteps = current.steps.map((s, i) => ({
+    index: i + 1,
+    id: s.id,
+    tool: s.tool,
+    description: s.description,
+    args: s.args,
+  }));
+  const compactParams = current.params.map((p) => ({
+    key: p.key,
+    label: p.label,
+    mode: p.mode ?? 'prompt',
+    instruction: p.instruction,
+    default: p.default,
+  }));
+  const targetNote = opts.targetStepId
+    ? `\n（用户可能特指 id=${opts.targetStepId} 的那一步。）`
+    : '';
+
+  const messages: LLMMessage[] = [
+    { role: 'system', content: RECORDING_EDIT_SYSTEM_PROMPT },
+    {
+      role: 'user',
+      content: `${currentDateTimeNote()}\n\n工作流名称：${current.name}\n\n步骤：\n${JSON.stringify(
+        compactSteps,
+        null,
+        2
+      )}\n\n参数：\n${JSON.stringify(compactParams, null, 2)}${targetNote}\n\n用户修改指令：${instruction}`,
+    },
+  ];
+
+  const content = await chatCompletion(messages, 'recording-edit', { maxTokens: 2500 });
+  const parsed = parseJsonLoose<{
+    name?: string;
+    steps?: Array<{ description?: string; tool?: string; args?: Record<string, unknown> }>;
+    params?: Array<{ key?: string; label?: string; mode?: string; instruction?: string; default?: string }>;
+  }>(content, 'the edited recording');
+
+  const steps: WorkflowStep[] = (parsed.steps ?? [])
+    .filter((s) => s.tool && getToolDefinition(s.tool))
+    .map((s) => {
+      const def = getToolDefinition(s.tool as string);
+      return {
+        id: crypto.randomUUID(),
+        description: s.description ?? s.tool ?? '',
+        tool: s.tool as string,
+        args: s.args ?? {},
+        riskLevel: def?.riskLevel ?? 'low',
+        requiresConfirmation: def?.requiresConfirmation ?? false,
+      };
+    });
+
+  // If the model returned nothing usable, keep the current flow unchanged.
+  if (!steps.length) return current;
+
+  const normMode = (m?: string): WorkflowParamMode =>
+    m === 'generate' || m === 'constant' ? m : 'prompt';
+  const params: WorkflowParam[] = (parsed.params ?? [])
+    .filter((p): p is { key: string; label?: string; mode?: string; instruction?: string; default?: string } =>
+      Boolean(p.key)
+    )
+    .map((p) => ({
+      key: p.key,
+      label: p.label ?? p.key,
+      mode: normMode(p.mode),
+      instruction: p.instruction,
+      default: p.default,
+    }));
+
+  return { name: parsed.name?.trim() || current.name, steps, params };
+}
+
+/**
+ * Produce a single string value at run time from a natural-language instruction
+ * (WorkflowParam mode='generate'). Site-agnostic. Returns '' on failure so replay
+ * can still proceed (the field is simply left empty).
+ */
+export async function generateValueWithLLM(
+  instruction: string,
+  ctx: { pageContext?: PageContext; note?: string } = {}
+): Promise<string> {
+  const pageSummary = ctx.pageContext ? summarizePageContext(ctx.pageContext, { maxTextChars: 400 }) : '';
+  const messages: LLMMessage[] = [
+    {
+      role: 'system',
+      content:
+        '你是一个取值生成器。根据用户给出的“生成说明”，产出一个可直接填入表单或用于操作的字符串值。只输出 JSON：{ "value": "..." }，不要解释、不要多余文字。',
+    },
+    {
+      role: 'user',
+      content: `${currentDateTimeNote()}\n\n生成说明：${instruction}${ctx.note ? `\n\n上下文：${ctx.note}` : ''}${
+        pageSummary ? `\n\n当前页面参考：\n${pageSummary}` : ''
+      }`,
+    },
+  ];
+  try {
+    const content = await chatCompletion(messages, 'value-gen', { maxTokens: 500 });
+    const parsed = parseJsonLoose<{ value?: unknown }>(content, 'the generated value');
+    return parsed.value == null ? '' : String(parsed.value);
+  } catch (err) {
+    debugLog({
+      source: 'llm',
+      level: 'warn',
+      category: 'value-gen.fallback',
+      message: `运行时取值生成失败：${err instanceof Error ? err.message : String(err)}`,
+    });
+    return '';
+  }
+}
+
+const VOICE_REFINE_SYSTEM_PROMPT = `你会把用户口述（语音转写）的一段话整理成一条简洁、清晰的任务指令。
+规则：
+- 保留关键实体与意图（对象、条件、数量、时间等），去掉口头语、重复、停顿词、语气词和转写噪声。
+- 用与用户相同的语言输出，尽量精炼成一到两句可执行的指令。
+- 不要新增用户没有表达的要求，也不要与具体站点绑定地臆测。
+只输出整理后的指令文本本身，不要加引号、解释或前后缀。`;
+
+/**
+ * Turn a raw speech transcript into a concise, intent-focused instruction.
+ * Site-agnostic. Returns the trimmed transcript unchanged on failure.
+ */
+export async function refineVoiceInstructionWithLLM(transcript: string): Promise<string> {
+  const raw = transcript.trim();
+  if (!raw) return '';
+  try {
+    const messages: LLMMessage[] = [
+      { role: 'system', content: VOICE_REFINE_SYSTEM_PROMPT },
+      { role: 'user', content: raw },
+    ];
+    const content = await chatCompletion(messages, 'voice-refine', {
+      jsonMode: false,
+      maxTokens: 500,
+    });
+    const cleaned = content.trim();
+    return cleaned || raw;
+  } catch (err) {
+    debugLog({
+      source: 'llm',
+      level: 'warn',
+      category: 'voice-refine.fallback',
+      message: `语音指令精简失败，返回原文：${err instanceof Error ? err.message : String(err)}`,
+    });
+    return raw;
+  }
 }

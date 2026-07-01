@@ -22,6 +22,9 @@ async function load(): Promise<void> {
     'authToken',
     'allowEvaluate',
     'allowPrivateNetwork',
+    'voiceEnabled',
+    'voiceLang',
+    'voiceRefine',
   ]);
   $<HTMLInputElement>('backendUrl').value = (s.backendUrl as string) ?? DEFAULT_BACKEND_URL;
   $<HTMLInputElement>('wsUrl').value = (s.wsUrl as string) ?? DEFAULT_WS_URL;
@@ -32,6 +35,9 @@ async function load(): Promise<void> {
   $<HTMLInputElement>('authToken').value = (s.authToken as string) ?? '';
   $<HTMLInputElement>('allowEvaluate').checked = s.allowEvaluate !== false;
   $<HTMLInputElement>('allowPrivateNetwork').checked = Boolean(s.allowPrivateNetwork);
+  $<HTMLInputElement>('voiceEnabled').checked = s.voiceEnabled !== false;
+  $<HTMLInputElement>('voiceRefine').checked = s.voiceRefine !== false;
+  $<HTMLInputElement>('voiceLang').value = (s.voiceLang as string) ?? 'zh-CN';
 
   try {
     const { config } = await sendMessage<{ config?: ServerConfig; error?: string }>({
@@ -64,6 +70,9 @@ async function save(): Promise<void> {
   const authToken = $<HTMLInputElement>('authToken').value.trim();
   const allowEvaluate = $<HTMLInputElement>('allowEvaluate').checked;
   const allowPrivateNetwork = $<HTMLInputElement>('allowPrivateNetwork').checked;
+  const voiceEnabled = $<HTMLInputElement>('voiceEnabled').checked;
+  const voiceRefine = $<HTMLInputElement>('voiceRefine').checked;
+  const voiceLang = $<HTMLInputElement>('voiceLang').value.trim() || 'zh-CN';
   await chrome.storage.local.set({
     backendUrl,
     wsUrl,
@@ -72,6 +81,9 @@ async function save(): Promise<void> {
     authToken,
     allowEvaluate,
     allowPrivateNetwork,
+    voiceEnabled,
+    voiceRefine,
+    voiceLang,
   });
 
   const serverPatch: Record<string, unknown> = {

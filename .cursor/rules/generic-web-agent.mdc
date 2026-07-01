@@ -1,0 +1,35 @@
+---
+description: Keep the web-agent generic — no per-site/per-scenario hacks in prompts or code
+alwaysApply: true
+---
+
+# Build a GENERIC web agent, not a pile of per-scenario patches
+
+This project is a general-purpose web agent meant to work across arbitrary sites and
+tasks. When a specific debugging case (e.g. a GitHub Actions run, an order-list filter,
+a dark-mode theme, a log-trend page) reveals a failure, do NOT patch the symptom for
+that one site/task. Extract the underlying, reusable flow/logic lesson and fix that.
+
+## Rules
+
+- **No site-specific branches or copy.** Never hardcode a domain, URL shape, button
+  label, page name, or task type in prompts, correction messages, tool descriptions,
+  or control flow. (No "GITHUB ACTIONS — …", no `深圳→shenzhen`, no dark-mode CSS
+  recipes, no "今天的订单" date rules, no ECharts/trend-page special cases.)
+- **Generalize the lesson.** Ask: "what generic behavior would have avoided this?"
+  Prefer improving generic mechanisms — anti-loop / stuck detection, don't-repeat-a-failed-action,
+  sanity-check-results, verify-before-done, honest give-up, robust selector/tool
+  error handling — over adding a scenario clause.
+- **Examples must be placeholders.** In prompts/errors use generic placeholders
+  (`text=<label>`, `tag:has-text('<label>')`), not real labels from one site.
+- **Fix real bugs generically.** Permissions, CSP handling, empty-result detection,
+  no-op click detection, etc. should be site-agnostic.
+- **Suggestions come from live page content**, not hardcoded per-page defaults.
+- **Comments may cite an illustrative example** (e.g. "some sites like X block eval via
+  CSP") as long as the behavior/logic stays site-agnostic.
+
+## When tempted to add a special case
+
+Stop and instead: (1) identify the generic root cause, (2) strengthen an existing
+generic mechanism or add a new site-agnostic one, (3) if truly unavoidable, ask the
+user before adding anything scenario-specific.

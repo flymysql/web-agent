@@ -25,6 +25,31 @@ function isClickable(el: Element): boolean {
 }
 
 /**
+ * Whether a control is ALREADY in its selected/active/checked state. Clicking a
+ * tab/toggle that's already selected legitimately produces no DOM change, which
+ * must NOT be mistaken for a "dead element" no-op — the desired state simply
+ * already holds, so the action has effectively succeeded. Site-agnostic: relies
+ * on ARIA state and common active-class conventions, not any specific page.
+ */
+function isAlreadyActiveControl(el: Element): boolean {
+  const host = el.closest('[aria-selected],[aria-pressed],[aria-checked],[aria-current],[role="tab"]') ?? el;
+  const truthy = (v: string | null): boolean => v != null && v !== 'false';
+  if (
+    host.getAttribute('aria-selected') === 'true' ||
+    host.getAttribute('aria-pressed') === 'true' ||
+    host.getAttribute('aria-checked') === 'true' ||
+    truthy(host.getAttribute('aria-current'))
+  ) {
+    return true;
+  }
+  const cls = typeof (host as HTMLElement).className === 'string' ? (host as HTMLElement).className.toLowerCase() : '';
+  if (/(^|[\s_-])(active|selected|current)([\s_-]|$)/.test(cls)) return true;
+  const input = el as HTMLInputElement;
+  if ((input.type === 'radio' || input.type === 'checkbox') && input.checked) return true;
+  return false;
+}
+
+/**
  * Cheap page-wide fingerprint: URL + element count + visible-text length.
  * Any real effect of a click (navigation, content swap, dropdown injecting
  * nodes, etc.) shifts at least one of these.
@@ -83,6 +108,38 @@ function findEl(selector: string): Element | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Resolve a selector, briefly waiting for the target to appear and (optionally)
+ * become visible/clickable before acting. Late- or lazy-loaded content is the
+ * usual reason a valid selector isn't present the instant we act — polling makes
+ * every interaction robust against it, for both the live agent and deterministic
+ * workflow replays (where the page may not have finished loading yet). If the
+ * element resolves but never satisfies visibility within the budget, the resolved
+ * node is returned so the caller can still scroll it into view; if it never
+ * resolves, the standard not-found error surfaces.
+ */
+async function resolveReady(
+  selector: string,
+  opts: { visible?: boolean; clickable?: boolean; timeoutMs?: number } = {}
+): Promise<Element> {
+  const timeoutMs = opts.timeoutMs ?? 6000;
+  const start = Date.now();
+  let last: Element | null = null;
+  for (;;) {
+    const el = findEl(selector);
+    if (el) {
+      last = el;
+      const okVisible = !opts.visible || isElementVisible(el);
+      const okClickable = !opts.clickable || isClickable(el);
+      if (okVisible && okClickable) return el;
+    }
+    if (Date.now() - start >= timeoutMs) break;
+    await sleep(150);
+  }
+  if (last) return last;
+  return resolveSelector(selector);
 }
 
 async function waitForCondition(args: Record<string, unknown>): Promise<ToolResult> {
@@ -147,6 +204,113 @@ function dispatchKey(target: Element | Document, combo: string): void {
   }
 }
 
+/** Is this element a real scroll container with clipped (scrollable) content? */
+function isScrollable(el: Element): boolean {
+  const s = getComputedStyle(el);
+  const oy = s.overflowY;
+  return (oy === 'auto' || oy === 'scroll' || oy === 'overlay') && el.scrollHeight > el.clientHeight + 40;
+}
+
+/** Find the scroll container to sweep: the element, a scrollable descendant, or an ancestor. */
+function findScrollable(el: Element): HTMLElement | null {
+  if (isScrollable(el)) return el as HTMLElement;
+  let best: HTMLElement | null = null;
+  const descendants = el.querySelectorAll('*');
+  const cap = Math.min(descendants.length, 3000);
+  for (let i = 0; i < cap; i++) {
+    const d = descendants[i];
+    if (isScrollable(d) && (!best || d.scrollHeight > best.scrollHeight)) best = d as HTMLElement;
+  }
+  if (best) return best;
+  let p: Element | null = el.parentElement;
+  while (p) {
+    if (isScrollable(p)) return p as HTMLElement;
+    p = p.parentElement;
+  }
+  return null;
+}
+
+/**
+ * Read all text from a scroll container by sweeping it top→bottom and
+ * accumulating unique lines. Virtualized lists (logs, long tables) keep only the
+ * visible rows in the DOM, so a single textContent read misses everything
+ * off-screen — scrolling forces each slice to render. Site-agnostic.
+ */
+async function accumulateByScrolling(scroller: HTMLElement): Promise<string> {
+  const original = scroller.scrollTop;
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  const pushSlice = (): void => {
+    const chunk = (scroller as HTMLElement).innerText ?? scroller.textContent ?? '';
+    for (const raw of chunk.split('\n')) {
+      const line = raw.replace(/[ \t]+/g, ' ').trim();
+      if (line && !seen.has(line)) {
+        seen.add(line);
+        lines.push(line);
+      }
+    }
+  };
+  const step = Math.max(100, scroller.clientHeight - 40);
+  scroller.scrollTop = 0;
+  await sleep(120);
+  let guard = 0;
+  for (;;) {
+    pushSlice();
+    const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 4;
+    if (atBottom || guard++ > 250) break;
+    scroller.scrollTop = Math.min(scroller.scrollTop + step, scroller.scrollHeight);
+    await sleep(120);
+  }
+  pushSlice();
+  scroller.scrollTop = original;
+  return lines.join('\n').slice(0, 20000);
+}
+
+/** Flag a region that renders on a <canvas> (terminal/chart) — no DOM text to read. */
+function detectCanvasArea(el: Element): string | undefined {
+  const canvases = el.querySelectorAll('canvas');
+  if (!canvases.length) return undefined;
+  const txtLen = (el.textContent ?? '').replace(/\s+/g, '').length;
+  let bigCanvas = false;
+  for (const c of Array.from(canvases)) {
+    const r = (c as HTMLElement).getBoundingClientRect();
+    if (r.width * r.height > 40000) {
+      bigCanvas = true;
+      break;
+    }
+  }
+  return bigCanvas && txtLen < 200
+    ? '该区域主要由 <canvas> 渲染（可能是终端/图表/绘制型内容），无法通过 DOM 提取文本。'
+    : undefined;
+}
+
+async function readTextRich(selector?: string): Promise<ToolResult> {
+  let base: Element | null;
+  if (selector) {
+    base = findEl(selector);
+    if (!base) return { success: false, error: `Element not found: ${selector}` };
+  } else {
+    base = document.body ?? document.documentElement;
+  }
+
+  const canvasNote = detectCanvasArea(base);
+  const scroller = findScrollable(base);
+
+  let text: string;
+  let scrolled = false;
+  if (scroller && scroller.scrollHeight > scroller.clientHeight + 40) {
+    text = await accumulateByScrolling(scroller);
+    scrolled = true;
+  } else {
+    text = getVisibleText(selector);
+  }
+
+  const result: Record<string, unknown> = { text };
+  if (scrolled) result.scrolledContainer = true;
+  if (canvasNote) result.note = canvasNote;
+  return { success: true, result };
+}
+
 export async function executeBrowserTool(
   tool: string,
   args: Record<string, unknown> = {}
@@ -159,7 +323,7 @@ export async function executeBrowserTool(
       case 'click': {
         const selector = args.selector as string;
         if (!selector) return { success: false, error: 'selector is required' };
-        const el = resolveSelector(selector) as HTMLElement;
+        const el = (await resolveReady(selector, { clickable: true })) as HTMLElement;
         el.scrollIntoView({ block: 'center', behavior: 'instant' });
         el.focus();
         const beforeGlobal = globalDigest();
@@ -168,6 +332,15 @@ export async function executeBrowserTool(
         // Wait for the page to settle, watching for navigation or any DOM change.
         const changed = await waitForClickEffect(beforeGlobal, beforeEl, el, 1200);
         if (!changed) {
+          // A no-change click on a control that's already selected/active is NOT a
+          // dead element — the desired state already holds. Report success so the
+          // agent moves on (e.g. reads the panel) instead of thrashing selectors.
+          if (isAlreadyActiveControl(el)) {
+            return {
+              success: true,
+              result: { clicked: selector, alreadyActive: true, note: '该元素已处于选中/激活状态，无需再次点击' },
+            };
+          }
           // The click resolved but produced no observable effect — almost always a
           // dead/JS-routed link or the wrong element. Report a soft failure so the
           // agent stops re-clicking the same target and tries another approach.
@@ -187,7 +360,7 @@ export async function executeBrowserTool(
         if (!selector || text === undefined) {
           return { success: false, error: 'selector and text are required' };
         }
-        const el = resolveSelector(selector) as HTMLElement;
+        const el = (await resolveReady(selector, { visible: true })) as HTMLElement;
         el.scrollIntoView({ block: 'center', behavior: 'instant' });
         el.focus();
         const editable =
@@ -247,11 +420,8 @@ export async function executeBrowserTool(
       case 'wait':
         return waitForCondition(args);
 
-      case 'readText': {
-        const selector = args.selector as string | undefined;
-        const text = getVisibleText(selector);
-        return { success: true, result: { text } };
-      }
+      case 'readText':
+        return readTextRich(args.selector as string | undefined);
 
       case 'getAttribute': {
         const selector = args.selector as string;
@@ -270,7 +440,7 @@ export async function executeBrowserTool(
         if (!selector || !value) {
           return { success: false, error: 'selector and value are required' };
         }
-        const el = resolveSelector(selector) as HTMLSelectElement;
+        const el = (await resolveReady(selector, { visible: true })) as HTMLSelectElement;
         const option = Array.from(el.options).find(
           (o) => o.value === value || o.text === value
         );
@@ -405,7 +575,7 @@ export async function executeBrowserTool(
         const key = args.key as string;
         if (!key) return { success: false, error: 'key is required' };
         const sel = args.selector as string | undefined;
-        const target = sel ? resolveSelector(sel) : (document.activeElement ?? document.body);
+        const target = sel ? await resolveReady(sel, { visible: true }) : (document.activeElement ?? document.body);
         (target as HTMLElement)?.focus?.();
         dispatchKey(target ?? document, key);
         return { success: true, result: { pressed: key } };
@@ -428,7 +598,7 @@ export async function executeBrowserTool(
         const selector = args.selector as string;
         const checked = (args.checked as boolean) ?? true;
         if (!selector) return { success: false, error: 'selector is required' };
-        const el = resolveSelector(selector) as HTMLInputElement;
+        const el = (await resolveReady(selector, { visible: true })) as HTMLInputElement;
         if (el.checked !== checked) {
           el.checked = checked;
           el.dispatchEvent(new Event('input', { bubbles: true }));

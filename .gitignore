@@ -2,6 +2,7 @@ node_modules/
 dist/
 chrome-extension/
 .env
+scripts/astra-tunnel/config.local.env
 *.log
 .DS_Store
 

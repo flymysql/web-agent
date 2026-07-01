@@ -101,7 +101,7 @@ export const BROWSER_TOOLS: ToolDefinition[] = [
   {
     name: 'injectCSS',
     description:
-      'Inject CSS into the page to restyle it (apply a dark theme, change colors/backgrounds/fonts/layout). Reliable and CSP-safe — prefer this for any theming. Pass a stable id (e.g. "theme") so re-injecting REPLACES the previous block instead of stacking endlessly. Do NOT use "* { background/color !important }" — that paints text the same colour as its background and makes everything invisible.',
+      'Inject CSS into the page to restyle it (colors, backgrounds, fonts, layout, theming). Reliable and CSP-safe — prefer this for any styling. Pass a stable id so re-injecting REPLACES the previous block instead of stacking endlessly.',
     parameters: [
       { name: 'css', type: 'string', description: 'Raw CSS text to inject', required: true },
       { name: 'id', type: 'string', description: 'Stable id for this style block; re-injecting with the same id replaces it (avoids piling up styles). Use e.g. "theme".', required: false },

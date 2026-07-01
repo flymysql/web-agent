@@ -5,6 +5,7 @@ import type {
   TaskCheckpoint,
   PageContext,
   RequestMode,
+  TaskAttachment,
 } from '@ai-browser-agent/shared';
 import { JsonRepository } from '../persistence/json-repository.js';
 import { debugLog } from '../debug/logger.js';
@@ -34,6 +35,7 @@ export function createTask(input: {
   loopIntervalMs?: number;
   loopMaxIterations?: number;
   workflowId?: string;
+  attachments?: TaskAttachment[];
 }): Task {
   const now = Date.now();
   const task: Task = {
@@ -48,6 +50,8 @@ export function createTask(input: {
     workflowId: input.workflowId,
     tabId: input.tabId,
     url: input.url,
+    startUrl: input.url,
+    attachments: input.attachments,
     currentStepIndex: 0,
     toolCalls: [],
     logs: [createLog('info', 'Task created', { userRequest: input.userRequest })],
@@ -110,6 +114,9 @@ export function setPageContext(taskId: string, pageContext: PageContext): Task {
   return updateTask(taskId, {
     checkpoint: { ...checkpoint, pageContext, savedAt: Date.now() },
     url: pageContext.url,
+    // Remember the very first page we observed as the stable start page; never
+    // overwrite it as the agent navigates (that's what `url` is for).
+    startUrl: task.startUrl ?? pageContext.url,
   });
 }
 

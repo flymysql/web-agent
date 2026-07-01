@@ -1,6 +1,7 @@
 import type {
   PageContext,
   Task,
+  TaskAttachment,
   TaskPlan,
   ToolCallRecord,
 } from './types.js';
@@ -77,6 +78,7 @@ export interface TaskCreatePayload {
   tabId?: number;
   url?: string;
   pageContext?: PageContext;
+  attachments?: TaskAttachment[];
   kind?: 'once' | 'loop';
   loopIntervalMs?: number;
   loopMaxIterations?: number;

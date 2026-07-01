@@ -54,6 +54,33 @@ export interface InteractiveElement {
   selector: string;
   visible: boolean;
   rect?: { x: number; y: number; width: number; height: number };
+  /** Computed accessible name (aria-label / associated label / title / text). */
+  accessibleName?: string;
+  /** Id of the PageRegion this element belongs to (see PageContext.regions). */
+  regionId?: string;
+  /** True when the control is disabled (native disabled or aria-disabled). */
+  disabled?: boolean;
+  /** aria-expanded state for disclosure controls (panels, menus, comboboxes). */
+  expanded?: boolean;
+}
+
+/**
+ * A semantic block of the page derived from landmarks / ARIA roles / semantic
+ * containers. Purely structural and site-agnostic — the `role` is a generic
+ * category inferred from the DOM, never a hardcoded site/page label.
+ */
+export interface PageRegion {
+  /** Stable-within-snapshot id, e.g. "region-3". */
+  id: string;
+  /** Generic role: navigation/search/main/form/dialog/list/table/toolbar/... */
+  role: string;
+  /** Accessible name or nearest heading text, when available. */
+  label?: string;
+  rect?: { x: number; y: number; width: number; height: number };
+  /** True when this region is a modal/dialog currently on top of the page. */
+  modalTop?: boolean;
+  /** How many interactive elements were assigned to this region. */
+  elementCount?: number;
 }
 
 export interface PageContext {
@@ -63,6 +90,12 @@ export interface PageContext {
   interactiveElements: InteractiveElement[];
   formFields: InteractiveElement[];
   links: Array<{ text: string; href: string; selector: string }>;
+  /** Semantic blocks of the page (landmarks, dialogs, lists, forms, ...). */
+  regions?: PageRegion[];
+  /** Document heading outline (h1-h6 / role=heading), in document order. */
+  headings?: Array<{ level: number; text: string }>;
+  /** Id of the region that is the currently focused modal/dialog, if any. */
+  activeDialogRegionId?: string;
   timestamp: number;
 }
 
@@ -87,6 +120,26 @@ export interface TaskCheckpoint {
   savedAt: number;
 }
 
+/**
+ * Anti-flail counters for the agent loop. Persisted on the task so they SURVIVE
+ * a pause/resume (e.g. a high-risk confirmation), which otherwise re-enters the
+ * loop with everything reset — letting a stuck task loop forever as long as it
+ * periodically hits a confirmation gate.
+ */
+export interface AgentGuardState {
+  totalFailures: number;
+  consecutiveFailures: number;
+  errorCounts: Record<string, number>;
+  actionCounts: Record<string, number>;
+  thoughtCounts: Record<string, number>;
+  redundantReads: number;
+  replanned: boolean;
+  /** Consecutive decision steps that produced no observable page/collected change. */
+  noProgressSteps: number;
+  /** Fingerprint of the last state considered "progress". */
+  lastProgressDigest?: string;
+}
+
 export interface TaskLogEntry {
   id: string;
   timestamp: number;
@@ -105,10 +158,24 @@ export interface WorkflowTrigger {
   urlPattern?: string;
 }
 
+/**
+ * How a workflow parameter's value is produced at run time:
+ * - 'prompt'   : ask the user (or use the run-time supplied value / default).
+ * - 'generate' : produce it automatically at run time from `instruction` (LLM),
+ *                for steps whose content isn't fixed (e.g. an auto-generated
+ *                text, a fresh value each run).
+ * - 'constant' : always use `default` as a fixed literal.
+ */
+export type WorkflowParamMode = 'prompt' | 'generate' | 'constant';
+
 export interface WorkflowParam {
   key: string;
   label: string;
   default?: string;
+  /** Defaults to 'prompt' when omitted (backward compatible). */
+  mode?: WorkflowParamMode;
+  /** Natural-language instruction describing how to produce the value (mode='generate'). */
+  instruction?: string;
 }
 
 export interface WorkflowStep {
@@ -118,6 +185,39 @@ export interface WorkflowStep {
   args: Record<string, unknown>;
   riskLevel: RiskLevel;
   requiresConfirmation: boolean;
+}
+
+/**
+ * One raw user interaction captured during a recording session, before the LLM
+ * "understand" pass turns it into clean WorkflowStep[]. Site-agnostic: `tool`
+ * and `args` reuse the normal browser tool vocabulary.
+ */
+export interface RecordedAction {
+  tool: string;
+  args: Record<string, unknown>;
+  /** Stable selector for the target element, when the action has one. */
+  selector?: string;
+  /** Human-meaningful label of the target (accessible name / text), for the LLM. */
+  label?: string;
+  /** The page URL at the time the action was captured. */
+  url?: string;
+  at: number;
+  /**
+   * Spoken narration / guidance the user gave near this action (aligned by
+   * timestamp during the "understand" pass). A hint for the LLM, not literal copy.
+   */
+  note?: string;
+}
+
+/**
+ * One spoken utterance captured while recording. `kind` distinguishes passive
+ * narration ("I'm clicking the filter") from explicit agent-guidance the user
+ * spoke on a key step ("here the agent should pick today's date"). Site-agnostic.
+ */
+export interface RecordingNarration {
+  text: string;
+  at: number;
+  kind: 'narration' | 'guidance';
 }
 
 export interface Workflow {
@@ -148,6 +248,21 @@ export interface CollectedItem {
   at: number;
 }
 
+/**
+ * A user-provided file attached to a task as AI input. Read on the client:
+ * text files have their content extracted into `text`; images are carried as a
+ * base64 `dataUrl` and only understood when a vision-capable model is enabled.
+ */
+export interface TaskAttachment {
+  name: string;
+  mime: string;
+  kind: 'text' | 'image';
+  /** Extracted UTF-8 content for text files (may be truncated). */
+  text?: string;
+  /** `data:` URL for image files. */
+  dataUrl?: string;
+}
+
 export interface Task {
   id: string;
   sessionId?: string;
@@ -171,9 +286,19 @@ export interface Task {
   recordedSteps?: WorkflowStep[];
   tabId?: number;
   url?: string;
+  /** Files the user attached as extra AI input for this task. */
+  attachments?: TaskAttachment[];
+  /**
+   * The page the task STARTED on. Unlike `url` (which tracks the latest observed
+   * page and changes as the agent navigates), this is captured once and stays
+   * fixed, so a workflow saved from this task remembers the right starting page.
+   */
+  startUrl?: string;
   plan?: TaskPlan;
   currentStepIndex: number;
   checkpoint?: TaskCheckpoint;
+  /** Persisted anti-flail counters (see AgentGuardState) — survive pause/resume. */
+  guardState?: AgentGuardState;
   toolCalls: ToolCallRecord[];
   logs: TaskLogEntry[];
   /** Durable results gathered during a map-reduce style run (deduped by key). */

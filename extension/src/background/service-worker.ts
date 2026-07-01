@@ -1,5 +1,11 @@
 import { DEFAULT_BACKEND_URL, DEFAULT_WS_URL } from '@ai-browser-agent/shared';
-import type { PageContext, Task, WsMessage } from '@ai-browser-agent/shared';
+import type {
+  PageContext,
+  RecordedAction,
+  RecordingNarration,
+  Task,
+  WsMessage,
+} from '@ai-browser-agent/shared';
 
 // ---------------------------------------------------------------------------
 // Settings (user-overridable via the options page / chrome.storage.local)
@@ -13,6 +19,112 @@ let allowEvaluate = true;
 let allowPrivateNetwork = false;
 const recentAutorun = new Map<string, number>();
 const AUTORUN_COOLDOWN_MS = 60_000;
+
+// ---------------------------------------------------------------------------
+// Action recording (capture user interactions → understand → workflow).
+// State lives here (not the content script) so it survives navigations, and is
+// mirrored to session storage so it survives a service-worker restart.
+// ---------------------------------------------------------------------------
+interface RecordingState {
+  /** The tab the recording started on (origin). */
+  tabId: number;
+  /** Every tab that belongs to this recording session (origin + tabs opened during it). */
+  tabIds: number[];
+  startUrl: string;
+  actions: RecordedAction[];
+  /** Spoken narration / guidance captured during the session (timestamped). */
+  narration: RecordingNarration[];
+}
+let recording: RecordingState | null = null;
+const RECORDING_KEY = 'agent_recording';
+// MV3 service workers are terminated aggressively (often mid-navigation). This
+// promise lets recording handlers wait until state has been rehydrated from
+// session storage after a restart, so a GET_RECORD_STATE / RECORD_ACTION / STOP
+// that arrives right after a wake doesn't see a spuriously-empty recording.
+let recordingReady: Promise<void> | null = null;
+
+async function loadRecording(): Promise<void> {
+  try {
+    const s = await chrome.storage.session.get(RECORDING_KEY);
+    recording = (s[RECORDING_KEY] as RecordingState | undefined) ?? null;
+    // Migrate state persisted before multi-tab / narration existed.
+    if (recording && !Array.isArray(recording.tabIds)) {
+      recording.tabIds = [recording.tabId];
+    }
+    if (recording && !Array.isArray(recording.narration)) {
+      recording.narration = [];
+    }
+  } catch {
+    /* session storage unavailable */
+  }
+}
+
+/** True when the tab belongs to the active recording session. */
+function isSessionTab(id?: number): boolean {
+  return id != null && !!recording && recording.tabIds.includes(id);
+}
+
+/** Only http(s) pages are replayable navigations; skip chrome://, about:blank, extension pages, etc. */
+function isRecordableUrl(url: string | undefined): url is string {
+  return !!url && /^https?:\/\//i.test(url);
+}
+
+/**
+ * Record a page transition as a `navigate` action so a multi-tab recording can
+ * be replayed deterministically in the single bound replay tab. Dedupes against
+ * the last navigate and skips the initial start page.
+ */
+function pushNavigate(url: string | undefined): void {
+  if (!recording || !isRecordableUrl(url)) return;
+  const last = recording.actions[recording.actions.length - 1];
+  if (last?.tool === 'navigate' && last.args?.url === url) return;
+  if (url === recording.startUrl && recording.actions.length === 0) return;
+  recording.actions.push({ tool: 'navigate', args: { url }, url, at: Date.now() });
+  void persistRecording();
+}
+
+function ensureRecordingLoaded(): Promise<void> {
+  if (!recordingReady) recordingReady = loadRecording();
+  return recordingReady;
+}
+
+async function persistRecording(): Promise<void> {
+  try {
+    if (recording) await chrome.storage.session.set({ [RECORDING_KEY]: recording });
+    else await chrome.storage.session.remove(RECORDING_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+// A tab opened while recording joins the session (covers link-open / window.open /
+// Ctrl+T). Its actions/navigation are then accepted like the origin tab's.
+chrome.tabs.onCreated.addListener((tab) => {
+  if (recording && tab.id != null && !recording.tabIds.includes(tab.id)) {
+    recording.tabIds.push(tab.id);
+    void persistRecording();
+  }
+});
+
+// Switching to another session tab is recorded as a navigate to that tab's URL,
+// so replay (single tab) follows the switch even when the tab was already loaded.
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  if (!isSessionTab(tabId)) return;
+  chrome.tabs
+    .get(tabId)
+    .then((tab) => pushNavigate(tab.url))
+    .catch(() => {});
+});
+
+// Drop a closed tab from the session; abandon the recording only when they're all gone.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (!recording) return;
+  recording.tabIds = recording.tabIds.filter((id) => id !== tabId);
+  if (recording.tabIds.length === 0) {
+    recording = null;
+  }
+  void persistRecording();
+});
 
 async function loadSettings(): Promise<void> {
   try {
@@ -343,6 +455,25 @@ function wasAgentNav(tabId: number): boolean {
   return at != null && Date.now() - at < AGENT_NAV_WINDOW_MS;
 }
 
+/**
+ * Normalize a navigation target. A bare host/path (`example.com/x`) gets an
+ * `https://` prefix, but any string that already carries a real scheme
+ * (`http:`, `data:`, `blob:`, `file:`, `about:`, `mailto:`, …) is passed through
+ * untouched — previously we prepended `https://` to everything non-http, which
+ * corrupted e.g. `data:text/html,…` into `https://data:text/html,…`.
+ *
+ * The tricky case is telling a scheme (`data:text`) apart from a host:port
+ * (`localhost:3000`): schemes are never followed immediately by digits, whereas
+ * a port always is — so a colon followed by a digit means it's a host:port and
+ * still needs the prefix.
+ */
+function normalizeNavUrl(url: string): string {
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(url);
+  const looksLikeHostPort = scheme ? /^\d/.test(url.slice(scheme[0].length)) : false;
+  if (!scheme || looksLikeHostPort) return 'https://' + url;
+  return url;
+}
+
 async function navigateOnTab(tabId: number, args: Record<string, unknown>): Promise<ToolOutcome> {
   const action = String(args.action ?? (args.url ? 'goto' : 'reload')).toLowerCase();
   const timeoutMs = Number(args.timeoutMs) || 15000;
@@ -353,7 +484,7 @@ async function navigateOnTab(tabId: number, args: Record<string, unknown>): Prom
     else {
       let url = String(args.url ?? '').trim();
       if (!url) return { success: false, error: 'url is required for goto' };
-      if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+      url = normalizeNavUrl(url);
       await chrome.tabs.update(tabId, { url });
     }
     await waitForTabComplete(tabId, timeoutMs);
@@ -371,7 +502,17 @@ async function screenshotTab(tabId: number): Promise<ToolOutcome> {
     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
     return { success: true, result: { dataUrl, length: dataUrl.length } };
   } catch (err) {
-    return { success: false, error: errMsg(err) };
+    const msg = errMsg(err);
+    // captureVisibleTab needs <all_urls> (or an activated activeTab). If it still
+    // fails, screenshots aren't available here — steer the agent to text/DOM tools.
+    if (/all_urls|activeTab|permission/i.test(msg)) {
+      return {
+        success: false,
+        error:
+          '截图不可用（缺少 <all_urls>/activeTab 权限，可能需要重新加载扩展）。请改用 getHTML / readText / 提取页面文本来获取所需信息，不要重复尝试 screenshot。',
+      };
+    }
+    return { success: false, error: msg };
   }
 }
 
@@ -1024,6 +1165,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             tabId: tab?.id,
             url: tab?.url,
             pageContext,
+            attachments: message.attachments,
             kind: message.kind ?? 'once',
             loopIntervalMs: message.loopIntervalMs,
             loopMaxIterations: message.loopMaxIterations,
@@ -1084,7 +1226,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         const tab = await getActiveTab();
         return apiRequest(`/api/workflows/${message.workflowId}/run`, {
           method: 'POST',
-          body: JSON.stringify({ params: message.params ?? {}, tabId: tab?.id, url: tab?.url }),
+          body: JSON.stringify({ params: message.params ?? {}, tabId: tab?.id, url: tab?.url, loopIntervalMs: message.loopIntervalMs }),
         });
       }
       case 'GET_WORKFLOW':
@@ -1105,6 +1247,143 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             triggers: message.triggers,
           }),
         });
+
+      case 'START_RECORDING': {
+        await ensureRecordingLoaded();
+        const tab = _sender.tab ?? (await getActiveTab());
+        const tabId = tab?.id;
+        if (tabId == null) return { ok: false, error: 'no active tab' };
+        recording = { tabId, tabIds: [tabId], startUrl: tab?.url ?? '', actions: [], narration: [] };
+        await persistRecording();
+        chrome.tabs
+          .sendMessage(tabId, { type: 'RECORD_CONTROL', args: { action: 'start' } }, { frameId: 0 })
+          .catch(() => {});
+        return { ok: true, recording: true };
+      }
+
+      case 'RECORD_ACTION': {
+        await ensureRecordingLoaded();
+        // Accept actions from any tab in the recording session.
+        if (recording && message.action && isSessionTab(_sender.tab?.id)) {
+          recording.actions.push(message.action as RecordedAction);
+          void persistRecording();
+        }
+        return { ok: true };
+      }
+
+      case 'NARRATION': {
+        await ensureRecordingLoaded();
+        // Spoken narration/guidance from any session tab is timestamped and stored
+        // for the "understand" pass to align onto the nearest recorded step.
+        if (recording && message.item && isSessionTab(_sender.tab?.id)) {
+          recording.narration.push(message.item as RecordingNarration);
+          void persistRecording();
+        }
+        return { ok: true };
+      }
+
+      case 'STOP_RECORDING': {
+        await ensureRecordingLoaded();
+        const data = recording;
+        // Turn off the recorder in every session tab, not just the origin.
+        const stopTabs = data?.tabIds ?? (_sender.tab?.id != null ? [_sender.tab.id] : []);
+        for (const tabId of stopTabs) {
+          chrome.tabs
+            .sendMessage(tabId, { type: 'RECORD_CONTROL', args: { action: 'stop' } }, { frameId: 0 })
+            .catch(() => {});
+        }
+        recording = null;
+        await persistRecording();
+        return {
+          ok: true,
+          actions: data?.actions ?? [],
+          narration: data?.narration ?? [],
+          startUrl: data?.startUrl ?? '',
+          count: data?.actions.length ?? 0,
+        };
+      }
+
+      case 'GET_RECORD_STATE':
+        await ensureRecordingLoaded();
+        return {
+          recording: Boolean(recording),
+          count: recording?.actions.length ?? 0,
+          startUrl: recording?.startUrl,
+        };
+
+      case 'UNDERSTAND_RECORDING': {
+        const tab = await getActiveTab();
+        const pageContext = tab?.id ? await getPageContext(tab.id) : undefined;
+        return apiRequest('/api/recordings/understand', {
+          method: 'POST',
+          body: JSON.stringify({
+            actions: message.actions,
+            narration: message.narration,
+            startUrl: message.startUrl,
+            pageContext,
+          }),
+        });
+      }
+
+      case 'REFINE_VOICE':
+        return apiRequest('/api/voice/refine', {
+          method: 'POST',
+          body: JSON.stringify({ transcript: message.transcript }),
+        });
+
+      case 'EDIT_RECORDING': {
+        const tab = await getActiveTab();
+        const pageContext = tab?.id ? await getPageContext(tab.id) : undefined;
+        return apiRequest('/api/recordings/edit', {
+          method: 'POST',
+          body: JSON.stringify({
+            name: message.name,
+            steps: message.steps,
+            params: message.params,
+            instruction: message.instruction,
+            targetStepId: message.targetStepId,
+            pageContext,
+          }),
+        });
+      }
+
+      case 'SAVE_RECORDING':
+        return apiRequest('/api/recordings/save', {
+          method: 'POST',
+          body: JSON.stringify({
+            name: message.name,
+            description: message.description,
+            steps: message.steps,
+            params: message.params,
+            startUrl: message.startUrl,
+            triggers: message.triggers,
+          }),
+        });
+
+      case 'DEMO_RECORDING': {
+        const tab = await getActiveTab();
+        return apiRequest('/api/recordings/demo', {
+          method: 'POST',
+          body: JSON.stringify({
+            name: message.name,
+            steps: message.steps,
+            params: message.params,
+            startUrl: message.startUrl,
+            tabId: tab?.id,
+            url: tab?.url,
+          }),
+        });
+      }
+
+      case 'OPEN_OPTIONS': {
+        // Content scripts can't call this API; the background page can.
+        if (chrome.runtime.openOptionsPage) {
+          await chrome.runtime.openOptionsPage();
+        } else {
+          await chrome.tabs.create({ url: chrome.runtime.getURL('options.html') });
+        }
+        return { ok: true };
+      }
 
       case 'GET_SERVER_CONFIG':
         return apiRequest('/api/config');
@@ -1134,6 +1413,26 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
       case 'PAGE_LOADED': {
         const url = message.url as string;
+
+        // Capture cross-page navigations authoritatively here (not in the content
+        // script): the click that triggers a navigation often unloads the page
+        // before its RECORD_ACTION can flush, and the fresh page's content script
+        // may miss the transition. PAGE_LOADED fires reliably on every top-frame
+        // load, so a recording never loses the page it moved to.
+        await ensureRecordingLoaded();
+        if (isSessionTab(_sender.tab?.id) && url) {
+          pushNavigate(url);
+          // Make sure the freshly-loaded session tab has its capture listeners on
+          // (belt-and-suspenders alongside the content script's own self-start).
+          chrome.tabs
+            .sendMessage(
+              _sender.tab!.id!,
+              { type: 'RECORD_CONTROL', args: { action: 'start' } },
+              { frameId: 0 }
+            )
+            .catch(() => {});
+        }
+
         if (!autorunEnabled) return { ran: 0, reason: 'autorun disabled' };
         if (autorunWhitelist.length && !autorunWhitelist.some((p) => p && url.includes(p))) {
           return { ran: 0, reason: 'not whitelisted' };
@@ -1175,6 +1474,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 // Boot
 // ---------------------------------------------------------------------------
 initNetworkCapture();
+void ensureRecordingLoaded();
 void loadSettings().then(connectBackend);
 
 setInterval(() => {
