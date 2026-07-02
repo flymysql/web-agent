@@ -20,10 +20,30 @@ function isVisible(el: Element): boolean {
   const rect = el.getBoundingClientRect();
   if (rect.width === 0 || rect.height === 0) return false;
   const style = window.getComputedStyle(el);
-  if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') {
+  if (style.visibility === 'hidden' || style.visibility === 'collapse' || style.display === 'none') {
     return false;
   }
+  // Near-zero opacity (e.g. 1e-05) is a common trick to keep an inert duplicate
+  // node in the tree; `=== '0'` alone misses "0.00001". Treat it as invisible.
+  const op = parseFloat(style.opacity);
+  if (!Number.isNaN(op) && op <= 0.01) return false;
   return true;
+}
+
+/**
+ * Is the element actually reachable by a real click at its center — i.e. NOT
+ * covered/pushed behind other content (e.g. a duplicate node with z-index:-1)?
+ * Offscreen elements can't be hit-tested, so we don't penalize them here.
+ * Site-agnostic; used only to break ties among a small set of text matches.
+ */
+function isHittable(el: Element): boolean {
+  const r = el.getBoundingClientRect();
+  const cx = r.left + r.width / 2;
+  const cy = r.top + r.height / 2;
+  if (cx < 0 || cy < 0 || cx > window.innerWidth || cy > window.innerHeight) return true;
+  const top = document.elementFromPoint(cx, cy);
+  if (!top) return true;
+  return el === top || el.contains(top) || top.contains(el);
 }
 
 /** Looks like a framework-generated unstable id (random hashes), unsafe for replay. */
@@ -258,10 +278,51 @@ function expandedState(el: Element): boolean | undefined {
   return undefined;
 }
 
+function boolAttr(el: Element, prop: 'required' | 'readOnly', aria: string): boolean | undefined {
+  if ((el as unknown as Record<string, unknown>)[prop] === true) return true;
+  const v = el.getAttribute(aria);
+  if (v === 'true') return true;
+  return undefined;
+}
+
+/** Checked state for native checkbox/radio or any aria-checked custom widget. */
+function checkedState(el: Element): boolean | undefined {
+  const input = el as HTMLInputElement;
+  if (input.type === 'checkbox' || input.type === 'radio') return input.checked;
+  const v = el.getAttribute('aria-checked');
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  return undefined;
+}
+
+function selectedState(el: Element): boolean | undefined {
+  const v = el.getAttribute('aria-selected');
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  return undefined;
+}
+
+/** True for a file-picker input, regardless of visibility (often hidden). */
+function isFileInputEl(el: Element): boolean {
+  return el instanceof HTMLInputElement && el.type === 'file';
+}
+
+/** Current value of a form control, truncated; never leaks a password field. */
+function controlValue(el: Element): string | undefined {
+  if (el instanceof HTMLInputElement) {
+    if (el.type === 'password' || el.type === 'file') return undefined;
+    return el.value ? clean(el.value, 80) : undefined;
+  }
+  if (el instanceof HTMLTextAreaElement) return el.value ? clean(el.value, 80) : undefined;
+  if (el instanceof HTMLSelectElement) return el.value ? clean(el.value, 80) : undefined;
+  return undefined;
+}
+
 function toInteractiveElement(el: Element, index: number, regionId?: string): InteractiveElement {
   const rect = el.getBoundingClientRect();
   const name = accessibleName(el);
   const expanded = expandedState(el);
+  const isFile = isFileInputEl(el);
   return {
     id: `el-${index}`,
     tag: el.tagName.toLowerCase(),
@@ -277,6 +338,15 @@ function toInteractiveElement(el: Element, index: number, regionId?: string): In
     regionId,
     disabled: isDisabled(el) || undefined,
     expanded,
+    checked: checkedState(el),
+    selected: selectedState(el),
+    value: controlValue(el),
+    required: boolAttr(el, 'required', 'aria-required'),
+    readOnly: boolAttr(el, 'readOnly', 'aria-readonly'),
+    isFileInput: isFile || undefined,
+    accepts: isFile ? el.getAttribute('accept') ?? undefined : undefined,
+    hasPopup: el.getAttribute('aria-haspopup') ?? undefined,
+    current: el.getAttribute('aria-current') ?? undefined,
     rect: {
       x: Math.round(rect.x),
       y: Math.round(rect.y),
@@ -463,6 +533,18 @@ const INTERACTIVE_SELECTORS = [
   '[role="button"]',
   '[role="link"]',
   '[role="textbox"]',
+  // Custom (non-native) controls common in SPAs — tabs, menus, options, toggles.
+  // Without these the real control (often a <div role="tab">) is invisible to the
+  // agent, forcing it to guess a text= selector that lands on an inert inner node.
+  '[role="tab"]',
+  '[role="menuitem"]',
+  '[role="menuitemcheckbox"]',
+  '[role="menuitemradio"]',
+  '[role="option"]',
+  '[role="switch"]',
+  '[role="checkbox"]',
+  '[role="radio"]',
+  '[role="treeitem"]',
   '[contenteditable="true"]',
   '[tabindex]:not([tabindex="-1"])',
 ].join(',');
@@ -526,12 +608,193 @@ export function querySelectorDeep(
   return null;
 }
 
+/**
+ * Latest text from live regions (aria-live / role=alert|status). These carry the
+ * page's own feedback after an action — validation errors, toasts, "saved!",
+ * "no results" — which is exactly the dynamic signal the agent needs but that a
+ * static element list misses. Site-agnostic: pure ARIA convention.
+ */
+function collectAnnouncements(): string[] {
+  // Light query on the main document only (no deep '*' shadow walk): live regions
+  // are near-universally in the top document, and a full-tree traversal here would
+  // add real cost on large pages for a rarely-present feature.
+  let nodes: Element[] = [];
+  try {
+    nodes = Array.from(
+      document.querySelectorAll(
+        '[aria-live="polite"],[aria-live="assertive"],[role="alert"],[role="status"],output'
+      )
+    );
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const el of nodes) {
+    if ((el as HTMLElement).id === AGENT_ROOT_ID || el.closest?.(`#${AGENT_ROOT_ID}`)) continue;
+    if (!isVisible(el)) continue;
+    const text = clean(el.textContent ?? '', 160);
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    out.push(text);
+    if (out.length >= 8) break;
+  }
+  return out;
+}
+
+/** Iframes on the top document, flagging whether their content is reachable. */
+function collectIframes(): Array<{ selector: string; sameOrigin: boolean; title?: string }> {
+  const out: Array<{ selector: string; sameOrigin: boolean; title?: string }> = [];
+  const frames = Array.from(document.querySelectorAll('iframe, frame'));
+  let i = 0;
+  for (const f of frames) {
+    if ((f as HTMLElement).closest?.(`#${AGENT_ROOT_ID}`)) continue;
+    if (!isVisible(f)) continue;
+    let sameOrigin = false;
+    try {
+      sameOrigin = !!(f as HTMLIFrameElement).contentDocument;
+    } catch {
+      sameOrigin = false;
+    }
+    const title =
+      f.getAttribute('title')?.trim() ||
+      f.getAttribute('aria-label')?.trim() ||
+      f.getAttribute('name')?.trim() ||
+      undefined;
+    out.push({ selector: tagElement(f, 10000 + i), sameOrigin, title });
+    if (++i >= 10) break;
+  }
+  return out;
+}
+
+/** A scroll container with clipped content (virtualized lists, log/code panels). */
+function isScrollableEl(el: Element): boolean {
+  try {
+    const s = getComputedStyle(el);
+    const oy = s.overflowY;
+    return (oy === 'auto' || oy === 'scroll' || oy === 'overlay') && el.scrollHeight > el.clientHeight + 40;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Inner scroll containers the agent may need to sweep to reveal off-screen rows.
+ *
+ * PERFORMANCE: `getComputedStyle` is expensive and, on a large/dynamic page (an
+ * infinite feed, a search-suggest overlay), calling it for thousands of elements
+ * per snapshot stalls every step. So we first apply a CHEAP geometry pre-filter
+ * (a scroll container must clip meaningful content: scrollHeight ≫ clientHeight)
+ * — pure layout reads that the browser batches into a single reflow — and only
+ * then confirm the (few) candidates' overflow style. Everything is capped and
+ * wrapped so a pathological page degrades to "no scrollables", never a hang.
+ */
+function collectScrollables(): Array<{ selector: string; label?: string; canScrollDown: boolean }> {
+  try {
+    const all = document.getElementsByTagName('*');
+    const scanCap = Math.min(all.length, 4000);
+    const candidates: Element[] = [];
+    for (let i = 0; i < scanCap && candidates.length < 60; i++) {
+      const el = all[i];
+      // Cheap: only elements that visibly clip a good chunk of content qualify.
+      if (el.clientHeight > 60 && el.scrollHeight > el.clientHeight + 200) {
+        candidates.push(el);
+      }
+    }
+    const found: Array<{ el: Element; area: number }> = [];
+    for (const el of candidates) {
+      if ((el as HTMLElement).id === AGENT_ROOT_ID || el.closest?.(`#${AGENT_ROOT_ID}`)) continue;
+      if (!isScrollableEl(el)) continue; // getComputedStyle only on the few candidates
+      const r = el.getBoundingClientRect();
+      if (r.width * r.height < 10000) continue;
+      found.push({ el, area: r.width * r.height });
+    }
+    found.sort((a, b) => b.area - a.area);
+    const out: Array<{ selector: string; label?: string; canScrollDown: boolean }> = [];
+    for (let i = 0; i < found.length && out.length < 6; i++) {
+      const el = found[i].el;
+      const canScrollDown = el.scrollTop + el.clientHeight < el.scrollHeight - 4;
+      out.push({
+        selector: tagElement(el, 11000 + i),
+        label: accessibleName(el) || undefined,
+        canScrollDown,
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/** Text contributed by an element's OWN direct text nodes (not descendants). */
+function directText(el: Element): string {
+  let s = '';
+  for (const node of Array.from(el.childNodes)) {
+    if (node.nodeType === Node.TEXT_NODE) s += node.textContent ?? '';
+  }
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Bounded capture of "clickable-looking" NON-semantic controls. Modern SPAs
+ * (React/Vue/…) build tabs, filter chips, custom buttons and card actions from
+ * bare <div>/<span> that carry a click handler but NO native/ARIA semantics — so
+ * INTERACTIVE_SELECTORS misses them and the agent is left guessing `text=` that
+ * lands on the wrong or an inert node. We surface such controls by their computed
+ * cursor:pointer, which is the one reliable, site-agnostic signal a bare element
+ * is meant to be clicked. Kept cheap: only leaf-ish elements with a SHORT own-text
+ * label pay for a getComputedStyle call, and both the scan and the output are
+ * hard-capped so this can't regress performance on large pages.
+ */
+function collectClickable(already: Set<Element>): Element[] {
+  const out: Element[] = [];
+  try {
+    const all = document.getElementsByTagName('*');
+    const scanCap = Math.min(all.length, 3000);
+    for (let i = 0; i < scanCap && out.length < 40; i++) {
+      const el = all[i];
+      if (already.has(el)) continue;
+      // Want leaf-ish controls (a tab/chip/button label), not big containers.
+      if (el.childElementCount > 3) continue;
+      const text = directText(el);
+      if (!text || text.length > 24) continue;
+      if ((el as HTMLElement).id === AGENT_ROOT_ID || el.closest?.(`#${AGENT_ROOT_ID}`)) continue;
+      // Already at/inside a semantic control we captured — avoid duplicates.
+      try {
+        if (el.closest(ACTIONABLE_SELECTOR)) continue;
+      } catch {
+        /* ignore selector-engine edge */
+      }
+      if (!isVisible(el)) continue;
+      let cursor = '';
+      try {
+        cursor = getComputedStyle(el).cursor;
+      } catch {
+        continue;
+      }
+      if (cursor !== 'pointer') continue;
+      out.push(el);
+    }
+  } catch {
+    /* ignore */
+  }
+  return out;
+}
+
 export function extractPageContext(): PageContext {
   const { regions, hostToId } = collectRegions();
 
   const collected: Element[] = [];
   collectDeep(INTERACTIVE_SELECTORS, document, collected);
-  const visibleNodes = collected.filter(isVisible);
+  // Surface non-semantic clickable controls (SPA tabs/chips/custom buttons) that
+  // have no native/ARIA affordance, so the agent gets a real el-N selector for
+  // them instead of guessing a text= selector that hits an inert node.
+  for (const el of collectClickable(new Set(collected))) collected.push(el);
+  // Keep file inputs even when hidden: sites routinely hide the real
+  // <input type=file> behind a styled button, but the agent must still SEE it so
+  // it can upload via that input instead of clicking the button (which opens the
+  // OS file dialog it cannot control).
+  const visibleNodes = collected.filter((el) => isVisible(el) || isFileInputEl(el));
 
   // Per-region budget: keep up to PER_REGION_CAP per block (and a separate cap
   // for elements outside any region) so a giant list can't crowd out the rest.
@@ -591,6 +854,9 @@ export function extractPageContext(): PageContext {
     regions: keptRegions,
     headings: collectHeadings(),
     activeDialogRegionId,
+    announcements: collectAnnouncements(),
+    iframes: collectIframes(),
+    scrollables: collectScrollables(),
     timestamp: Date.now(),
   };
 }
@@ -622,7 +888,20 @@ function parseTextSelector(selector: string): { leading: string; text: string } 
   return null;
 }
 
-const ACTIONABLE_SELECTOR = "a[href],button,[role='button'],summary,[onclick],input,select,textarea,[tabindex]";
+/**
+ * Roles/attributes that mark a real clickable control, including the custom
+ * (non-native) controls modern SPAs build from <div>/<span>. Kept in sync with
+ * the click tool's own detection so text= resolution and the click no-op retry
+ * agree on "what is clickable". Site-agnostic.
+ */
+const CLICKABLE_ROLE_SELECTOR =
+  "[role='button'],[role='link'],[role='tab'],[role='menuitem']," +
+  "[role='menuitemcheckbox'],[role='menuitemradio'],[role='option']," +
+  "[role='switch'],[role='checkbox'],[role='radio'],[role='treeitem']";
+
+const ACTIONABLE_SELECTOR = `a[href],button,summary,[onclick],input,select,textarea,[tabindex],${CLICKABLE_ROLE_SELECTOR}`;
+
+const ANCESTOR_SELECTOR = `a[href],button,summary,[onclick],[tabindex],${CLICKABLE_ROLE_SELECTOR}`;
 
 function isActionable(el: Element): boolean {
   try {
@@ -635,7 +914,7 @@ function isActionable(el: Element): boolean {
 /** The element itself if clickable, else its nearest clickable ancestor. */
 function actionableAncestor(el: Element): Element | null {
   try {
-    return el.closest("a[href],button,[role='button'],summary,[onclick]");
+    return el.closest(ANCESTOR_SELECTOR);
   } catch {
     return null;
   }
@@ -677,6 +956,11 @@ function resolveByText(leading: string, text: string): Element | null {
     const av = isVisible(a.el) ? 0 : 1;
     const bv = isVisible(b.el) ? 0 : 1;
     if (av !== bv) return av - bv;
+    // 1b) among visible, prefer the one actually on top (not covered / z-index:-1),
+    //     so a hidden duplicate that reports as visible still loses to the real one.
+    const ah = av === 0 && isHittable(a.el) ? 0 : 1;
+    const bh = bv === 0 && isHittable(b.el) ? 0 : 1;
+    if (ah !== bh) return ah - bh;
     // 2) clickable (or inside a clickable) first — avoids matching inert label
     //    text like a heading when a real link/button has the same words.
     const ac = clickableScore(a.el);

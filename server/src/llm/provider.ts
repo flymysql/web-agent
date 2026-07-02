@@ -1,5 +1,6 @@
 import type {
   PlanStep,
+  PlannedStep,
   TaskPlan,
   PageContext,
   TaskAttachment,
@@ -722,16 +723,22 @@ Available tools:
 ${TOOLS_BRIEF}
 READ THE PAGE STRUCTURE FIRST: the CURRENT PAGE section gives you a Heading outline and a "Page regions" list — each region is a semantic block ([navigation]/[search]/[form]/[dialog]/[list]/[table]/[toolbar]/…) with its label and the key controls inside it (shown as "selector → label [tag/role] (state)"). Use this to understand what each block is FOR and which control does what, then pick the right control for the GOAL. States like (collapsed)/(expanded) tell you a panel/menu can be opened; (disabled) means it can't be used yet.
 MODAL FOCUS: if a region is marked "(modal, on top)" or the page flags a 置顶弹窗/对话框, operate INSIDE that dialog (or close it first) — do not act on the background behind it.
+REACT TO CHANGE: the "最近变化（上一步之后）" block tells you what your LAST action actually did. If it says the page barely changed / didn't hit the target, your selector or approach was wrong — pick a DIFFERENT control or selector, do NOT repeat it. If a dialog/toast/new block appeared, act on it. Also read the "页面提示/状态 (live regions)" block — it is the page's own feedback (validation errors, "no results", "saved"); trust it over your assumptions.
+ELEMENT STATE: controls show live state — (checked/unchecked), (selected/current), (expanded/collapsed), (disabled), (required), (value="…"), (haspopup=…). Don't re-toggle something already in the desired state; open (collapsed) panels/(haspopup) menus to reveal more; a (disabled) submit usually means a required field is still empty.
+FILE / IMAGE UPLOAD: NEVER click an upload button/area or a file <input> — that opens the operating-system file dialog, which you CANNOT control (the task would stall waiting for the user). Instead find the file input listed under "文件上传控件" (or any input[type=file], even hidden) and call uploadFile with that selector plus a GENERATED file: pass name (e.g. note.txt / data.csv) and content (the text/CSV/JSON you generate yourself). For an image, first get a real image via imageSearch, fetch it with httpRequest, and pass it as a data: URL in content. Respect the input's accept types when choosing the file kind.
 Selectors should come from the current page's regions/controls (use their selector field).
 SELECTOR STRATEGY: prefer the el-N ids and the selectors listed under Page regions. When you want an element by its visible label and don't have a clean CSS path, you MAY use text matching: text=<label> or tag:has-text('<label>') (these ARE supported). Do NOT keep retrying combinator/sibling guesses like a:has-text('x') ~ button. Never repeat a selector that just failed — switch to a text selector or a different listed control.
 ANTI-LOOP: if clicking a link sends you to the wrong page and you navigate back only to click it again, STOP — that link is not the path to the goal. Pick a different element on the current page, or use needsInput to ask the user.
 The CURRENT PAGE section below is ALWAYS refreshed for you before every decision — you can already see the page's structure, text and controls. Therefore NEVER call extractPage/observe just to "read" or "get" the page; that wastes a step. Act directly (click a specific control, navigate, type, expand a collapsed panel, etc.) or finish with done.
+READ, DON'T PRE-SCROLL: to read/analyze an article or any page whose text is already in the document (posts, docs, diffs, comments), just call readText ONCE — it returns the full text (including everything below the fold; it even sweeps a lazy/virtualized list for you). Do NOT scroll first to "load" a static article — the text is already loaded in the DOM. Reserve scroll for the specific case where new items only appear as you scroll (infinite feeds) AND readText clearly returned too little.
+COLLECT & RANK A LIST: when the goal is to gather many rows from a result/list page and then sort/filter/pick top-N (e.g. by a number shown on each row), call readText ONCE to get the whole list as text (it already includes each row's label and its inline numbers), then parse and rank from that text. Do NOT loop scroll + hand-written evaluate to scrape rows one screen at a time — that is slow and error-prone. Only if readText returns clearly too few rows for an infinite feed should you scroll a bit and readText again.
 EXPLORE BEFORE ASKING: if the data the GOAL needs isn't visible yet but a region/control could reveal it (an expandable panel, an "add field/column" control, a filter, a different tab/view, or a row's detail page), DO that action yourself instead of asking the user to click. Only ask the user when the GOAL itself is ambiguous — never as a substitute for exploring the page.
 The plan is only a rough hint — adapt freely to what the page actually shows. If reality differs from the plan, change course to reach the GOAL instead of following the plan literally.
 Do NOT repeat an action that already failed or produced no progress; try a DIFFERENT selector, link, or tool. If you already have the information the goal needs, set done=true and put the answer in "summary".
 For a multi-item goal (e.g. "summarize every article in a series", OR "for each order list the buyer name & address"): first gather the list of item URLs from the current page, then DELEGATE one item at a time, ALWAYS passing the url: delegate({"url":"/post/123/","title":"...","goal":"summarize this article"}). Each result is stored automatically and shown to you under "进度". NEVER re-delegate an item already listed there, and do NOT open/read items yourself — let sub-agents do it. When every item is collected, simply set done=true; the system AUTO-SYNTHESIZES all collected items into the final answer, so you do NOT need to write the combined summary yourself.
 CRAWL VIA LINKS (very important): if the GOAL needs a field (buyer name, address, price, phone, status, detail text…) that is NOT present on the current list/index page, do NOT keep re-running evaluate/getHTML on the list hoping it appears — it won't. The data lives on each row's DETAIL page. Collect each row's detail link (from the page's links/interactive elements, or read the row's <a href>), then DELEGATE one row at a time with that url and a goal like "extract the buyer name and shipping address from this order". The sub-agent opens the detail page, extracts the fields, and the result is stored + auto-synthesized. If a row has no obvious link, click into the first row to learn the detail-URL pattern, then delegate the rest by url. Treat "evaluate returned empty/!found twice" as the signal to switch to this crawl-by-detail-page approach instead of repeating it.
 Open a different page with navigate (do not guess URLs into clicks). After any action that triggers loading, use wait (selector/text/urlIncludes) before reading the result. Before declaring done, use expect to verify the goal actually holds.
+SWITCH VIEW VIA URL WHEN CLICKS DON'T WORK: if clicking a tab / segment / filter / nav item produces no page change twice (some sites ignore script-triggered clicks, or route on trusted events only), STOP clicking it and do NOT switch to evaluate to click it — instead switch that view through the URL: use the control's <a href> if it has one, or infer the parameter/path from the CURRENT url (e.g. a query param or segment that encodes which tab/view is active) and navigate there directly. Changing the URL is the reliable way to switch views that resist synthetic clicks.
 If the goal is genuinely underspecified or the needed target/info simply is not reachable from the pages you can see (so continuing would just be blind guessing), STOP and ASK the user ONE concise question instead of clicking around randomly.
 BUT ask sparingly and never as a stall: BEFORE using needsInput, check the conversation history AND the current page — if the answer (or a sensible default) is already inferable, just USE it and proceed, briefly stating the assumption you made. For informational/"how do I write X" questions, prefer giving a concrete answer with the value filled in (note any assumption) over asking for an exact token. Map obvious user inputs yourself to the corresponding value/token that already appears on the page or in the URL/path, instead of asking for the exact literal. NEVER re-ask a question the user has already effectively answered in the thread — adopt their reply and continue; asking the same thing twice is a bug.
 DATE/TIME: the user message starts with 『当前日期时间』 — that is the real current local date/time. Always use it for any "今天/昨天/本周/最近" reasoning (e.g. filling a date filter with today's date). NEVER guess or hallucinate the current date.
@@ -747,19 +754,42 @@ RECOVERY — if a change you made breaks the page (content disappears, blank, lo
 Keep each injectCSS payload focused and not excessively long; if a theme needs a lot of CSS, split it across a few injectCSS calls rather than one giant string (huge JSON values can get truncated). Use setStyle/setText/setHTML/setAttribute/removeElement only for targeted one-off DOM changes; use getHTML to inspect structure; and use evaluate to run arbitrary JavaScript as a last resort. Prefer the most specific tool and actually perform the task. To access the internet use webSearch (find pages/info), imageSearch (returns DIRECT image URLs for pictures), or httpRequest (call any HTTP API) — these run through the browser and have network access. To put a picture on the page, FIRST call imageSearch to get a real working image URL, THEN injectCSS with background-image:url(...) — never invent image URLs. ALL network access MUST go through these browser tools — there is NO server-side fetch.
 Set done=true when the goal is achieved, or when it cannot proceed. Avoid repeating a failed action; try an alternative. Keep your "thought" to ONE concise sentence — do not write long explanations.`;
 
-export async function decideNextAction(
-  goal: string,
-  pageContext: PageContext,
-  history: AgentHistoryItem[],
-  planHint?: TaskPlan,
-  conversationContext?: string,
-  correction?: string,
-  progress?: string,
-  /** Optional viewport screenshot (dataURL); only used when LLM_VISION is on. */
-  screenshot?: string,
-  /** Files the user attached to the task (text merged into prompt, images to vision). */
-  attachments?: TaskAttachment[]
-): Promise<AgentDecision> {
+export interface AgentPromptInput {
+  goal: string;
+  pageContext: PageContext;
+  history: AgentHistoryItem[];
+  planHint?: TaskPlan;
+  conversationContext?: string;
+  correction?: string;
+  progress?: string;
+  screenshot?: string;
+  attachments?: TaskAttachment[];
+  changeSummary?: string;
+}
+
+/**
+ * Builds the shared user-prompt for an agent decision (single or batched). Both
+ * `decideNextAction` and `decideNextBatch` use the identical GOAL / CURRENT PAGE
+ * / HISTORY / change / correction assembly — only the system prompt and output
+ * contract differ.
+ */
+function buildAgentUserText(input: AgentPromptInput): {
+  userText: string;
+  images: (string | undefined)[];
+} {
+  const {
+    goal,
+    pageContext,
+    history,
+    planHint,
+    conversationContext,
+    correction,
+    progress,
+    screenshot,
+    attachments,
+    changeSummary,
+  } = input;
+
   const shown = history.slice(-HISTORY_WINDOW);
   const omitted = history.length - shown.length;
   const historyText = history.length
@@ -786,10 +816,42 @@ export async function decideNextAction(
 
   const { textBlock, images: attachImages } = summarizeAttachments(attachments);
   const filesBlock = textBlock ? `\n\n${textBlock}` : '';
-  const userText = `${currentDateTimeNote()}\n\nGOAL: ${goal}${hint}${ctxBlock}${filesBlock}${progress ? `\n\n进度（以下条目已采集完成，切勿重复处理）：\n${progress}` : ''}\n\nCURRENT PAGE:\n${summarizePageContext(pageContext, { withSelectors: true })}\n\nHISTORY:\n${historyText}${correction ? `\n\n⚠️ 重要提醒：${correction}` : ''}`;
+  const changeBlock = changeSummary ? `\n\n最近变化（上一步之后）：\n${changeSummary}` : '';
+  const userText = `${currentDateTimeNote()}\n\nGOAL: ${goal}${hint}${ctxBlock}${filesBlock}${progress ? `\n\n进度（以下条目已采集完成，切勿重复处理）：\n${progress}` : ''}${changeBlock}\n\nCURRENT PAGE:\n${summarizePageContext(pageContext, { withSelectors: true })}\n\nHISTORY:\n${historyText}${correction ? `\n\n⚠️ 重要提醒：${correction}` : ''}`;
+
+  return { userText, images: [screenshot, ...attachImages] };
+}
+
+export async function decideNextAction(
+  goal: string,
+  pageContext: PageContext,
+  history: AgentHistoryItem[],
+  planHint?: TaskPlan,
+  conversationContext?: string,
+  correction?: string,
+  progress?: string,
+  /** Optional viewport screenshot (dataURL); only used when LLM_VISION is on. */
+  screenshot?: string,
+  /** Files the user attached to the task (text merged into prompt, images to vision). */
+  attachments?: TaskAttachment[],
+  /** What changed on the page since the previous decision (server-computed diff). */
+  changeSummary?: string
+): Promise<AgentDecision> {
+  const { userText, images } = buildAgentUserText({
+    goal,
+    pageContext,
+    history,
+    planHint,
+    conversationContext,
+    correction,
+    progress,
+    screenshot,
+    attachments,
+    changeSummary,
+  });
   const messages: LLMMessage[] = [
     { role: 'system', content: AGENT_SYSTEM_PROMPT },
-    { role: 'user', content: buildUserContent(userText, [screenshot, ...attachImages]) },
+    { role: 'user', content: buildUserContent(userText, images) },
   ];
 
   // A per-step decision is a short JSON (a thought + one action). Cap the output
@@ -808,6 +870,168 @@ export async function decideNextAction(
     needsInput: Boolean(parsed.needsInput),
     question: parsed.question,
   };
+}
+
+export interface BatchDecision {
+  thought: string;
+  done: boolean;
+  summary?: string;
+  needsInput?: boolean;
+  question?: string;
+  /** 1..N consecutive actions the model is confident can run on THIS page. */
+  steps: PlannedStep[];
+}
+
+/** Default cap on how many actions one batched decision may emit. */
+export function getAgentBatchMax(): number {
+  const n = parseInt(process.env.LLM_AGENT_BATCH_MAX ?? '5', 10);
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(n, 12);
+}
+
+const BATCH_OUTPUT_ADDENDUM = `
+BATCHED OUTPUT — VERY IMPORTANT: instead of one action, output the NEXT run of actions you are confident can execute CONSECUTIVELY on THIS SAME page, so they can run WITHOUT asking you again after each one. Rules:
+- Emit at most {MAX} actions. Emit FEWER (even just 1) whenever you are not sure the later action's target will exist.
+- STOP the batch BEFORE any action whose target only appears AFTER an earlier action changes the page in a way you cannot predict (e.g. after a navigate, after opening a result list, after a submit that loads a new view). Never guess selectors for a page you have not seen — end the batch and you will be called again with that new page.
+- For EACH action give a deterministic post-condition in "expect" describing how to tell it worked, preferring (in order): a "selector" that should appear (or {"selector":"…","state":"gone"} for something that should disappear), a "text" the page should then contain, or a "urlIncludes". Use "attribute"+"equals" for a control's state. Only use {"changed":true} when nothing more specific applies.
+- Use "verify" (a short natural-language check) ONLY for the rare step where no deterministic "expect" is possible; prefer "expect".
+- If the goal is already achieved, return done=true with a summary and an empty steps array. If blocked, return needsInput with a question and empty steps.
+Respond ONLY with valid JSON:
+{ "thought": "one short sentence (≤25 words)", "done": false, "steps": [ { "tool": "toolName", "args": { }, "expect": { "selector": "…" }, "thought": "why" } ] }
+{ "thought": "why finished", "done": true, "summary": "what was accomplished", "steps": [] }
+{ "thought": "why blocked", "needsInput": true, "question": "你想…?（用中文问一个具体问题）", "steps": [] }`;
+
+/**
+ * Batched variant of decideNextAction: returns a run of consecutive actions,
+ * each with a verification, so the orchestrator can execute them optimistically
+ * and only call the LLM again when a step's expectation fails (the "stuck point").
+ */
+export async function decideNextBatch(
+  goal: string,
+  pageContext: PageContext,
+  history: AgentHistoryItem[],
+  planHint?: TaskPlan,
+  conversationContext?: string,
+  correction?: string,
+  progress?: string,
+  screenshot?: string,
+  attachments?: TaskAttachment[],
+  changeSummary?: string
+): Promise<BatchDecision> {
+  const { userText, images } = buildAgentUserText({
+    goal,
+    pageContext,
+    history,
+    planHint,
+    conversationContext,
+    correction,
+    progress,
+    screenshot,
+    attachments,
+    changeSummary,
+  });
+  const max = getAgentBatchMax();
+  const system = `${AGENT_SYSTEM_PROMPT}\n${BATCH_OUTPUT_ADDENDUM.replace('{MAX}', String(max))}`;
+  const messages: LLMMessage[] = [
+    { role: 'system', content: system },
+    { role: 'user', content: buildUserContent(userText, images) },
+  ];
+
+  const agentMaxTokens = parseInt(process.env.LLM_AGENT_MAX_TOKENS ?? '2048', 10);
+  const content = await chatCompletion(messages, 'agent', { maxTokens: agentMaxTokens });
+  const parsed = parseJsonLoose<{
+    thought?: string;
+    done?: boolean;
+    summary?: string;
+    needsInput?: boolean;
+    question?: string;
+    steps?: Array<{
+      tool?: string;
+      args?: Record<string, unknown>;
+      expect?: PlannedStep['expect'];
+      verify?: string;
+      thought?: string;
+    }>;
+  }>(content, 'the next batch');
+
+  const steps: PlannedStep[] = Array.isArray(parsed.steps)
+    ? parsed.steps
+        .filter((s): s is { tool: string } & typeof s => !!s && typeof s.tool === 'string' && !!s.tool.trim())
+        .slice(0, max)
+        .map((s) => ({
+          tool: s.tool,
+          args: s.args ?? {},
+          expect: s.expect,
+          verify: typeof s.verify === 'string' ? s.verify : undefined,
+          thought: typeof s.thought === 'string' ? s.thought : undefined,
+        }))
+    : [];
+
+  return {
+    thought: parsed.thought ?? '',
+    done: Boolean(parsed.done),
+    summary: parsed.summary,
+    needsInput: Boolean(parsed.needsInput),
+    question: parsed.question,
+    steps,
+  };
+}
+
+const VERIFY_SYSTEM_PROMPT = `You verify whether a browser action achieved its intended effect. Given a CHECK to perform and the resulting page, answer strictly whether the check now holds. Be lenient about wording but strict about facts. Respond ONLY with JSON: { "ok": true|false, "reason": "short" }.`;
+
+/**
+ * Lightweight semantic verification used ONLY for the rare step whose success
+ * cannot be expressed as a deterministic `expect`. One small LLM call.
+ */
+export async function verifyExpectation(
+  check: string,
+  pageContext: PageContext
+): Promise<{ ok: boolean; reason?: string }> {
+  const userText = `CHECK: ${check}\n\nCURRENT PAGE:\n${summarizePageContext(pageContext, {
+    maxTextChars: 1500,
+  })}`;
+  const messages: LLMMessage[] = [
+    { role: 'system', content: VERIFY_SYSTEM_PROMPT },
+    { role: 'user', content: userText },
+  ];
+  const content = await chatCompletion(messages, 'agent', { maxTokens: 200 });
+  const parsed = parseJsonLoose<{ ok?: boolean; reason?: string }>(content, 'the verification');
+  return { ok: Boolean(parsed.ok), reason: parsed.reason };
+}
+
+const REVIEW_SYSTEM_PROMPT = `你是一个严格的结果审查员。给定用户的原始任务目标和 Agent 打算作为最终结果交付的内容，判断这份结果是否真正、实质性地回答/完成了目标。
+
+判为不合格（ok=false）的典型情况：
+- 结果为空，或只是页面导航/页脚/版权/备案号/菜单等与目标无关的样板文字；
+- 结果只描述了"执行了哪些操作"，却没有目标要求的实际数据/答案/结论；
+- 目标要求"找出 N 个/某类信息"，但结果里没有对应的具体条目或数量明显不足；
+- 结果与目标主题明显不相关。
+
+判为合格（ok=true）：结果包含目标所要求的实质内容（哪怕不完整，但确实是相关数据/答案）。
+
+只输出 JSON：{"ok": boolean, "reason": "一句话中文说明", "missing": "若不合格，说明还缺什么/下一步该做什么"}`;
+
+/**
+ * Self-review the assembled final result against the goal BEFORE presenting it,
+ * so the agent never declares success on empty/irrelevant boilerplate, and a
+ * give-up honestly says it found nothing instead of dumping page chrome.
+ * Site-agnostic.
+ */
+export async function reviewResult(
+  goal: string,
+  result: string
+): Promise<{ ok: boolean; reason?: string; missing?: string }> {
+  const clipped = result.length > 4000 ? `${result.slice(0, 4000)}…` : result;
+  const messages: LLMMessage[] = [
+    { role: 'system', content: REVIEW_SYSTEM_PROMPT },
+    { role: 'user', content: `任务目标：${goal}\n\n拟交付的结果：\n${clipped}` },
+  ];
+  const content = await chatCompletion(messages, 'agent', { maxTokens: 200 });
+  const parsed = parseJsonLoose<{ ok?: boolean; reason?: string; missing?: string }>(
+    content,
+    'the result review'
+  );
+  return { ok: Boolean(parsed.ok), reason: parsed.reason, missing: parsed.missing };
 }
 
 /**

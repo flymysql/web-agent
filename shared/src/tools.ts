@@ -386,6 +386,61 @@ export const BROWSER_TOOLS: ToolDefinition[] = [
     riskLevel: 'low',
     runtime: 'browser',
   },
+  {
+    name: 'doubleClick',
+    description: 'Double-click an element (e.g. to open an item, enter edit mode, or select a word).',
+    parameters: [
+      { name: 'selector', type: 'string', description: 'CSS selector or element id', required: true },
+    ],
+    riskLevel: 'medium',
+    runtime: 'browser',
+  },
+  {
+    name: 'rightClick',
+    description: 'Right-click an element to open its context menu (dispatches contextmenu).',
+    parameters: [
+      { name: 'selector', type: 'string', description: 'CSS selector or element id', required: true },
+    ],
+    riskLevel: 'medium',
+    runtime: 'browser',
+  },
+  {
+    name: 'focus',
+    description: 'Focus an element without clicking it (e.g. to reveal a dropdown or ready a field for pressKey).',
+    parameters: [
+      { name: 'selector', type: 'string', description: 'CSS selector or element id', required: true },
+    ],
+    riskLevel: 'low',
+    runtime: 'browser',
+  },
+  {
+    name: 'clear',
+    description: 'Clear the value of an input, textarea, or contenteditable element.',
+    parameters: [
+      { name: 'selector', type: 'string', description: 'CSS selector or element id', required: true },
+    ],
+    riskLevel: 'medium',
+    runtime: 'browser',
+  },
+  {
+    name: 'setRange',
+    description: 'Set the value of a slider or numeric input (input[type=range|number]) and fire input/change.',
+    parameters: [
+      { name: 'selector', type: 'string', description: 'CSS selector or element id', required: true },
+      { name: 'value', type: 'number', description: 'Numeric value to set', required: true },
+    ],
+    riskLevel: 'medium',
+    runtime: 'browser',
+  },
+  {
+    name: 'scrollIntoView',
+    description: 'Scroll an element into the center of the viewport (reveal a lazy/off-screen element before reading or acting on it).',
+    parameters: [
+      { name: 'selector', type: 'string', description: 'CSS selector or element id', required: true },
+    ],
+    riskLevel: 'low',
+    runtime: 'browser',
+  },
 ];
 
 export const BACKEND_TOOLS: ToolDefinition[] = [

@@ -32,12 +32,16 @@ import { getRuntimeConfig } from '../config/runtime-config.js';
 import { debugLog } from '../debug/logger.js';
 import {
   decideNextAction,
+  decideNextBatch,
+  verifyExpectation,
+  reviewResult,
   generateSummaryWithLLM,
   routeIntent,
   answerChat,
   isVisionEnabled,
   type AgentHistoryItem,
 } from '../llm/provider.js';
+import type { PlannedStep } from '@ai-browser-agent/shared';
 
 /** Per-run step budget; the agent auto-continues past this up to the hard cap. */
 function getDefaultMaxSteps(): number {
@@ -60,8 +64,41 @@ function isAutoContinueEnabled(): boolean {
   return process.env.AGENT_AUTO_CONTINUE !== 'false';
 }
 const MAX_CONSECUTIVE_FAILURES = 3;
-/** How many times a single LLM decision can fail (timeout/rate-limit) before giving up. */
+/** How many times a single LLM decision can fail (bad output/parse) before giving up. */
 const MAX_DECISION_FAILURES = 4;
+/**
+ * A transient LLM/network outage gets a longer, backed-off retry budget, and when
+ * exhausted the task is PAUSED (resumable, progress kept) rather than terminally
+ * failed — so a backend blip doesn't throw away a long task.
+ */
+const MAX_TRANSIENT_DECISION_FAILURES = 8;
+
+/**
+ * Heuristic: does this error look like a transient service/network problem
+ * (backend down, timeout, rate-limit, 5xx) rather than a permanent one (bad
+ * config, invalid request)? Site-/provider-agnostic — keys off standard status
+ * codes, connection errors, and common "unavailable/service down" wording.
+ */
+function isTransientLLMError(msg: string): boolean {
+  const m = msg.toLowerCase();
+  return (
+    /\b(408|425|429|5\d\d|498)\b/.test(m) ||
+    m.includes('timeout') ||
+    m.includes('timed out') ||
+    m.includes('econnrefused') ||
+    m.includes('econnreset') ||
+    m.includes('etimedout') ||
+    m.includes('enotfound') ||
+    m.includes('socket hang up') ||
+    m.includes('fetch failed') ||
+    m.includes('network') ||
+    m.includes('service down') ||
+    m.includes('unavailable') ||
+    m.includes('temporarily') ||
+    m.includes('overloaded') ||
+    m.includes('rate limit')
+  );
+}
 /** Consecutive no-change steps before we replan; and before we honestly give up. */
 const NO_PROGRESS_SOFT = 6;
 const NO_PROGRESS_HARD = 10;
@@ -75,6 +112,65 @@ const STUCK_SKIP_CORRECTION =
   '不要再在这一个点上反复换选择器重试：如果整体任务还有其它可以独立完成的部分，先跳过这个子目标去完成其余部分；' +
   '把已经拿到的结果如实汇总（用 done 给出 summary，说明哪些拿到了、哪一部分受阻）；' +
   '如果整个目标都卡在这个受阻点，就用 needsInput 向用户说明卡在哪里并请求帮助。绝不要谎报成功。';
+
+/** Labels of the interactive controls on a page (accessible name / text). */
+function controlLabels(ctx: PageContext): Set<string> {
+  const out = new Set<string>();
+  for (const el of ctx.interactiveElements ?? []) {
+    const label = (el.accessibleName ?? el.text ?? '').replace(/\s+/g, ' ').trim();
+    if (label) out.add(label.slice(0, 40));
+  }
+  return out;
+}
+
+/**
+ * Concise, site-agnostic summary of what changed between two page snapshots —
+ * the signal the model needs to judge whether its last action actually did
+ * anything (a click that swapped a panel, opened a dialog, surfaced a toast, or
+ * did nothing at all). Returns undefined for the first observation.
+ */
+function summarizeContextChange(
+  prev: PageContext | undefined,
+  cur: PageContext
+): string | undefined {
+  if (!prev) return undefined;
+  const parts: string[] = [];
+
+  if (prev.url !== cur.url) parts.push(`页面已跳转：${prev.url} → ${cur.url}`);
+
+  const prevDialog = prev.regions?.find((r) => r.id === prev.activeDialogRegionId);
+  const curDialog = cur.regions?.find((r) => r.id === cur.activeDialogRegionId);
+  if (!prevDialog && curDialog) parts.push(`出现弹窗/对话框「${curDialog.label ?? curDialog.role}」`);
+  else if (prevDialog && !curDialog) parts.push('弹窗/对话框已关闭');
+
+  const prevRegions = new Set((prev.regions ?? []).map((r) => `${r.role}:${r.label ?? ''}`));
+  const curRegions = new Set((cur.regions ?? []).map((r) => `${r.role}:${r.label ?? ''}`));
+  const newRegions = [...curRegions].filter((r) => !prevRegions.has(r));
+  const goneRegions = [...prevRegions].filter((r) => !curRegions.has(r));
+  if (newRegions.length) parts.push(`新增区块：${newRegions.slice(0, 4).join('、')}`);
+  if (goneRegions.length) parts.push(`消失区块：${goneRegions.slice(0, 4).join('、')}`);
+
+  const prevLabels = controlLabels(prev);
+  const curLabels = controlLabels(cur);
+  const newControls = [...curLabels].filter((l) => !prevLabels.has(l));
+  if (newControls.length) parts.push(`新增控件：${newControls.slice(0, 6).join('、')}`);
+
+  const prevAnn = new Set(prev.announcements ?? []);
+  const newAnn = (cur.announcements ?? []).filter((a) => !prevAnn.has(a));
+  if (newAnn.length) parts.push(`新的页面提示：${newAnn.slice(0, 4).join(' / ')}`);
+
+  const dCount =
+    (cur.interactiveElements?.length ?? 0) - (prev.interactiveElements?.length ?? 0);
+  if (parts.length === 0) {
+    // Nothing observable moved — an important cue that the last action likely
+    // missed its target (wrong selector / dead control).
+    return Math.abs(dCount) >= 3
+      ? `页面无明显结构变化（可交互元素数 ${dCount > 0 ? '+' : ''}${dCount}）。`
+      : '页面几乎没有变化——上一步操作很可能没有命中目标或没有效果。';
+  }
+  if (dCount) parts.push(`可交互元素数 ${dCount > 0 ? '+' : ''}${dCount}`);
+  return parts.join('；');
+}
 
 /** Task ids with an agent loop currently running — prevents double execution. */
 const activeAgentLoops = new Set<string>();
@@ -277,7 +373,14 @@ async function runReplay(taskId: string): Promise<Task> {
     emit(taskId);
 
     const confirmation = requiresConfirmation(step.tool, step.args, step.description);
-    if (confirmation.required && !step.requiresConfirmation) {
+    // In deterministic replay, 'auto' runs high-risk steps silently; 'ask' and
+    // 'reject' both fall back to pausing (silently dropping a committed workflow
+    // step would be more surprising than asking).
+    if (
+      confirmation.required &&
+      (task.confirmPolicy ?? 'ask') !== 'auto' &&
+      !step.requiresConfirmation
+    ) {
       step.requiresConfirmation = true;
       step.riskLevel = 'high';
     }
@@ -391,12 +494,33 @@ function makeSyntheticStep(
   };
 }
 
-function summarizeToolResult(tool: string, result: unknown): string {
+/**
+ * Tools whose result IS information the model needs to reason with (not just a
+ * confirmation that an action happened). Their output gets a much larger budget
+ * in the model-facing history — otherwise a read/analyze goal (review a diff,
+ * summarize logs, extract data) can never SEE what it just read and loops.
+ * Action tools (click/type/navigate/…) are absent here and stay terse.
+ */
+const CONTENT_RESULT_CAPS: Record<string, number> = {
+  readText: 8000,
+  getHTML: 6000,
+  evaluate: 6000,
+  inspect: 2000,
+  getAttribute: 1200,
+  consoleLogs: 4000,
+  network: 4000,
+};
+
+const DEFAULT_RESULT_CAP = 200;
+
+function summarizeToolResult(tool: string, result: unknown, full = false): string {
   if (tool === 'extractPage') return 'page extracted';
   if (result == null) return 'ok';
   try {
     const text = typeof result === 'string' ? result : JSON.stringify(result);
-    return text.slice(0, 200);
+    const cap = full ? (CONTENT_RESULT_CAPS[tool] ?? DEFAULT_RESULT_CAP) : DEFAULT_RESULT_CAP;
+    if (text.length <= cap) return text;
+    return `${text.slice(0, cap)}…<+${text.length - cap} 字符已截断，可用 readText 指定 selector 读取某区域>`;
   } catch {
     return 'ok';
   }
@@ -414,13 +538,18 @@ function compactArgs(args: Record<string, unknown>): Record<string, unknown> {
   return out;
 }
 
+/** Keep the full content budget only for the most recent reads, so a large diff
+ * the model just fetched is visible now, while older reads shrink to bound tokens. */
+const FULL_RESULT_RECENCY = 3;
+
 function buildHistory(task: Task): AgentHistoryItem[] {
-  return task.toolCalls.map((c) => ({
+  const lastIdx = task.toolCalls.length - 1;
+  return task.toolCalls.map((c, i) => ({
     tool: c.tool,
     args: compactArgs(c.args),
     success: !c.error,
     error: c.error,
-    result: c.error ? undefined : summarizeToolResult(c.tool, c.result),
+    result: c.error ? undefined : summarizeToolResult(c.tool, c.result, lastIdx - i < FULL_RESULT_RECENCY),
   }));
 }
 
@@ -572,6 +701,93 @@ async function recoverReplayStep(
 }
 
 /**
+ * Verify a step's post-condition after it executed. Deterministic `expect`
+ * checks run the browser `expect` tool DIRECTLY (bypassing executeStep so they
+ * never pollute history), with a short bounded poll to tolerate lazy-loaded /
+ * late-rendering content. `{changed:true}` is checked against the page diff. A
+ * natural-language `verify` falls back to ONE light LLM check. No expectation =>
+ * treated as a pass. Never throws — an inconclusive check counts as a pass so it
+ * can't wedge the loop.
+ */
+async function verifyStep(
+  task: Task,
+  step: PlannedStep,
+  curCtx: PageContext | undefined,
+  prevCtx: PageContext | undefined
+): Promise<{ ok: boolean; reason?: string }> {
+  const exp = step.expect;
+  if (exp) {
+    const hasSpecific = !!(exp.selector || exp.text || exp.urlIncludes);
+    // Weakest check: only require the page to have moved since the step.
+    if (exp.changed && !hasSpecific) {
+      if (!prevCtx || !curCtx) return { ok: true };
+      const diff = summarizeContextChange(prevCtx, curCtx);
+      const noChange = !diff || diff.includes('几乎没有变化') || diff.includes('无明显结构变化');
+      return noChange ? { ok: false, reason: '页面几乎没有变化' } : { ok: true };
+    }
+    if (hasSpecific || (exp.selector && exp.attribute)) {
+      return verifyExpectDeterministic(task, exp);
+    }
+    return { ok: true };
+  }
+  if (step.verify && curCtx) {
+    try {
+      const r = await verifyExpectation(step.verify, curCtx);
+      return { ok: r.ok, reason: r.reason };
+    } catch {
+      return { ok: true };
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * Run the browser `expect` tool for a deterministic expectation, polling a few
+ * times so lazy content has a chance to appear. Handles state:'gone' by treating
+ * an expect failure (element absent/hidden) as success.
+ */
+async function verifyExpectDeterministic(
+  task: Task,
+  exp: NonNullable<PlannedStep['expect']>
+): Promise<{ ok: boolean; reason?: string }> {
+  if (!browserToolExecutor) return { ok: true };
+  const wantGone =
+    exp.state === 'gone' && !!exp.selector && !exp.text && !exp.urlIncludes && !exp.attribute;
+
+  const args: Record<string, unknown> = {};
+  if (exp.selector && exp.state !== 'gone') args.selector = exp.selector;
+  if (wantGone) args.selector = exp.selector;
+  if (exp.text) args.text = exp.text;
+  if (exp.urlIncludes) args.urlIncludes = exp.urlIncludes;
+  if (exp.selector && exp.attribute) {
+    args.selector = exp.selector;
+    args.attribute = exp.attribute;
+    if (exp.equals !== undefined) args.equals = exp.equals;
+  }
+  if (Object.keys(args).length === 0) return { ok: true };
+
+  const tries = 3;
+  let lastErr: string | undefined;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const res = await browserToolExecutor(task.id, 'expect', args, uuidv4(), undefined);
+      if (wantGone) {
+        if (!res.success) return { ok: true };
+        lastErr = `元素仍然可见：${exp.selector}`;
+      } else if (res.success) {
+        return { ok: true };
+      } else {
+        lastErr = res.error;
+      }
+    } catch (e) {
+      lastErr = e instanceof Error ? e.message : String(e);
+    }
+    if (i < tries - 1) await new Promise((r) => setTimeout(r, 500));
+  }
+  return { ok: false, reason: lastErr };
+}
+
+/**
  * Capture a viewport screenshot for the optional vision layer. Runs the browser
  * `screenshot` tool DIRECTLY (bypassing executeStep) so it never pollutes the
  * task history/audit — it's context for the model, not an agent action. Returns
@@ -630,6 +846,17 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
   let redundantReads = 0;
   let replanned = false;
   let offlineHits = 0;
+  // How many times a self-reviewed "done" was bounced back for being empty/
+  // irrelevant. Bounded so a genuinely-impossible task still terminates.
+  let doneReviewRetries = 0;
+  // The page snapshot used for the PREVIOUS decision, so each step can tell the
+  // model exactly what its last action changed (or that nothing changed).
+  let prevDecisionContext: PageContext | undefined;
+  // Optimistic batch queue: actions returned by one decideNextBatch call are
+  // executed consecutively (verified locally) WITHOUT re-invoking the LLM. Only
+  // a failed/unexpected step clears the queue and forces a fresh decision.
+  // Rehydrated from the task so it survives pause/resume (e.g. a confirmation).
+  let batchQueue: PlannedStep[] = task.pendingBatch ? [...task.pendingBatch] : [];
   // Navigation and any success reset consecutiveFailures, which can mask a task
   // that flails for dozens of steps across many URLs. These cumulative tallies
   // are NEVER reset, so we can escalate (and ultimately ask the user) early.
@@ -672,6 +899,12 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
         lastProgressDigest,
       },
     });
+  };
+
+  // Persist the remaining optimistic batch so a pause/resume (confirmation) or a
+  // continued run picks up exactly where it left off instead of re-deciding.
+  const persistBatch = (): void => {
+    task = updateTask(taskId, { pendingBatch: [...batchQueue] });
   };
 
   if (activeAgentLoops.has(taskId)) return task;
@@ -764,7 +997,12 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
     // items); if it doesn't move for several steps, replan once, then give up
     // honestly — regardless of how varied the individual actions look.
     const collectedCount = getTask(taskId)?.collected?.length ?? 0;
-    const progressDigest = `${pageContext.url}|${pageContext.interactiveElements?.length ?? 0}|${collectedCount}`;
+    // Include a coarse rendered-content signal (text length) so that scrolling a
+    // lazy/virtualized feed — which renders new rows without changing the URL or
+    // (capped) element count — still counts as progress and doesn't trip the
+    // stuck detector. Bucketed to avoid churn from tiny/among-step jitter.
+    const textBucket = Math.floor((pageContext.visibleText?.length ?? 0) / 200);
+    const progressDigest = `${pageContext.url}|${pageContext.interactiveElements?.length ?? 0}|${collectedCount}|${textBucket}`;
     if (progressDigest === lastProgressDigest) {
       noProgressSteps++;
     } else {
@@ -788,9 +1026,10 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
       task = updateTask(taskId, {
         status: 'completed',
         outcome: 'gave_up',
-        result:
-          (await finalizeResult(taskId)) +
-          '\n\n⚠️ 多步尝试后页面始终没有变化，判断当前目标在此页面无法继续（可能内容为空或位于无法读取的区域），已停止并给出已获得的部分结果。',
+        result: await finalizeWithReview(
+          taskId,
+          '⚠️ 多步尝试后页面始终没有变化，判断当前目标在此页面无法继续（可能内容为空或位于无法读取的区域），已停止。'
+        ),
         recordedSteps: recordWorkflowDraft(task),
       });
       addLog(taskId, 'warn', `🛑 连续 ${noProgressSteps} 步无进展，诚实停止（部分完成）`);
@@ -799,83 +1038,156 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
       break;
     }
 
-    let decision;
-    try {
-      const screenshot = await captureScreenshotForVision(task);
-      decision = await decideNextAction(task.userRequest, pageContext, buildHistory(task), task.plan, conversationContext, correction, progressBlock(task), screenshot, task.attachments);
-      decisionFailures = 0;
-      // Keep a correction in effect for a couple of turns so the model actually
-      // changes course, instead of clearing it after a single decision.
-      if (correctionTtl > 0) {
-        correctionTtl--;
-        if (correctionTtl === 0) correction = undefined;
-      } else {
-        correction = undefined;
+    // Tell the model what the previous action actually changed on the page
+    // (lazy-loaded blocks, a new dialog/toast, or nothing at all — a strong cue
+    // the last action missed its target).
+    const changeSummary = summarizeContextChange(prevDecisionContext, pageContext);
+    prevDecisionContext = pageContext;
+
+    // Only call the LLM when the optimistic batch queue is empty. Steps that pass
+    // their local verification auto-advance from the queue with NO new decision.
+    if (batchQueue.length === 0) {
+      let batch;
+      try {
+        const screenshot = await captureScreenshotForVision(task);
+        batch = await decideNextBatch(task.userRequest, pageContext, buildHistory(task), task.plan, conversationContext, correction, progressBlock(task), screenshot, task.attachments, changeSummary);
+        decisionFailures = 0;
+        // Keep a correction in effect for a couple of turns so the model actually
+        // changes course, instead of clearing it after a single decision.
+        if (correctionTtl > 0) {
+          correctionTtl--;
+          if (correctionTtl === 0) correction = undefined;
+        } else {
+          correction = undefined;
+        }
+      } catch (err) {
+        // A single LLM hiccup (timeout / rate limit) must NOT kill a long task.
+        // Retry a few times before giving up.
+        decisionFailures++;
+        const msg = err instanceof Error ? err.message : String(err);
+        const transient = isTransientLLMError(msg);
+        const limit = transient ? MAX_TRANSIENT_DECISION_FAILURES : MAX_DECISION_FAILURES;
+        addLog(taskId, 'warn', `决策失败(${decisionFailures}/${limit})：${msg}`);
+        emit(taskId);
+        if (decisionFailures >= limit) {
+          if (transient) {
+            // Backend outage — pause instead of terminally failing so the
+            // collected progress survives and the task can resume when the LLM
+            // service recovers.
+            persistGuards();
+            task = updateTask(taskId, {
+              status: 'paused',
+              assistantMessage: `LLM 服务暂时不可用，已暂停并保留进度，服务恢复后可继续。（${msg}）`,
+            });
+            addLog(taskId, 'warn', '⏸ LLM 服务暂时不可用，已暂停任务（进度已保留，稍后可继续）');
+          } else {
+            task = updateTask(taskId, {
+              status: 'failed',
+              outcome: 'failed',
+              error: `决策连续失败：${msg}`,
+            });
+          }
+          emit(taskId);
+          break;
+        }
+        // Exponential-ish backoff for transient errors so we don't hammer a
+        // struggling backend; a quick fixed wait for one-off bad outputs.
+        const backoff = transient ? Math.min(1500 * decisionFailures, 8000) : 1500;
+        await new Promise((r) => setTimeout(r, backoff));
+        continue;
       }
-    } catch (err) {
-      // A single LLM hiccup (timeout / rate limit) must NOT kill a long task.
-      // Retry a few times before giving up.
-      decisionFailures++;
-      const msg = err instanceof Error ? err.message : String(err);
-      addLog(taskId, 'warn', `决策失败(${decisionFailures}/${MAX_DECISION_FAILURES})：${msg}`);
-      emit(taskId);
-      if (decisionFailures >= MAX_DECISION_FAILURES) {
+
+      if (batch.thought) {
+        addLog(taskId, 'info', `🤔 ${batch.thought}`);
+        emit(taskId);
+      }
+
+      // The agent can ask the user for missing info instead of guessing blindly.
+      if (batch.needsInput) {
+        const q = batch.question?.trim() || '我需要更多信息才能继续，能补充一下吗？';
         task = updateTask(taskId, {
-          status: 'failed',
-          outcome: 'failed',
-          error: `决策连续失败：${msg}`,
+          status: 'needs_input',
+          intent: 'clarify',
+          clarifyQuestion: q,
+          assistantMessage: q,
         });
+        addLog(taskId, 'info', '需要你补充信息');
+        emit(taskId);
         break;
       }
-      await new Promise((r) => setTimeout(r, 1500));
-      continue;
-    }
 
-    if (decision.thought) {
-      addLog(taskId, 'info', `🤔 ${decision.thought}`);
-      emit(taskId);
-    }
+      if (batch.done) {
+        // Final verification: re-observe so the recorded result reflects the true end state.
+        const finalCtx = await observePage(task);
+        if (finalCtx) pageContext = finalCtx;
+        const finalResult = await finalizeResult(taskId, batch.summary);
 
-    // The agent can ask the user for missing info instead of guessing blindly.
-    if (decision.needsInput) {
-      const q = decision.question?.trim() || '我需要更多信息才能继续，能补充一下吗？';
-      task = updateTask(taskId, {
-        status: 'needs_input',
-        intent: 'clarify',
-        clarifyQuestion: q,
-        assistantMessage: q,
-      });
-      addLog(taskId, 'info', '需要你补充信息');
-      emit(taskId);
-      break;
-    }
+        // Self-review: never declare success on empty/irrelevant boilerplate. If
+        // the result doesn't actually answer the goal, bounce back into the loop
+        // (bounded) with a correction so the agent keeps gathering the real data.
+        const MAX_DONE_REVIEW_RETRIES = 2;
+        let review: { ok: boolean; reason?: string; missing?: string } | undefined;
+        try {
+          review = await reviewResult(task.userRequest, finalResult);
+        } catch {
+          review = { ok: true }; // reviewer failed → don't block completion
+        }
+        if (!review.ok && doneReviewRetries < MAX_DONE_REVIEW_RETRIES) {
+          doneReviewRetries++;
+          batchQueue = [];
+          persistBatch();
+          correction =
+            `你判定任务完成，但结果审查未通过：${review.reason ?? '结果与目标不符或为空'}。` +
+            `${review.missing ? `还缺少：${review.missing}。` : ''}` +
+            `请不要用页面导航/页脚等无关文字充当结果——继续操作以获取目标真正要求的数据，只有拿到实质内容后再判定 done。`;
+          correctionTtl = 2;
+          addLog(taskId, 'warn', `🔍 结果审查未通过，继续推进：${review.reason ?? ''}`);
+          emit(taskId);
+          continue;
+        }
 
-    if (decision.done) {
-      // Final verification: re-observe so the recorded result reflects the true end state.
-      const finalCtx = await observePage(task);
-      if (finalCtx) pageContext = finalCtx;
-      const finalResult = await finalizeResult(taskId, decision.summary);
-      task = updateTask(taskId, {
-        status: 'completed',
-        outcome: 'success',
-        result: finalResult,
-        recordedSteps: recordWorkflowDraft(task),
-      });
-      addLog(taskId, 'info', 'Agent 判定任务完成');
-      emit(taskId);
-      break;
-    }
-
-    const action = decision.action;
-    if (!action?.tool) {
-      consecutiveFailures++;
-      addLog(taskId, 'warn', 'LLM 未给出有效动作');
-      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-        task = updateTask(taskId, { status: 'failed', error: 'Agent 连续多次未产出有效动作' });
+        const reviewFailed = review && !review.ok;
+        task = updateTask(taskId, {
+          status: 'completed',
+          outcome: reviewFailed ? 'gave_up' : 'success',
+          result: reviewFailed
+            ? `${finalResult}\n\n⚠️ 结果审查提示：${review?.reason ?? '未能获取目标所需的实质内容'}。以上为已获取的部分信息，可能未完成目标。`
+            : finalResult,
+          recordedSteps: recordWorkflowDraft(task),
+        });
+        addLog(taskId, 'info', reviewFailed ? 'Agent 判定完成但审查未通过（部分完成）' : 'Agent 判定任务完成');
+        emit(taskId);
         break;
       }
-      continue;
+
+      if (!batch.steps.length) {
+        consecutiveFailures++;
+        addLog(taskId, 'warn', 'LLM 未给出有效动作');
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          task = updateTask(taskId, { status: 'failed', error: 'Agent 连续多次未产出有效动作' });
+          break;
+        }
+        continue;
+      }
+
+      batchQueue = batch.steps.slice();
+      if (batchQueue.length > 1) {
+        addLog(taskId, 'info', `🧠 规划出 ${batchQueue.length} 步可连续执行的动作，将逐步执行并本地校验`);
+        emit(taskId);
+      }
+      persistBatch();
     }
+
+    // Dequeue the next optimistic step. Its thought/expectation drive local
+    // verification after execution.
+    const planned = batchQueue.shift()!;
+    persistBatch();
+    const stepThought = planned.thought ?? '';
+    if (stepThought) {
+      addLog(taskId, 'info', `🤔 ${stepThought}`);
+      emit(taskId);
+    }
+    const action = { tool: planned.tool, args: planned.args ?? {} };
 
     // The page is re-observed for the model every iteration, so calling
     // extractPage as an action is redundant. Skip it and nudge the model to act
@@ -883,7 +1195,7 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
     if (action.tool === 'extractPage' || action.tool === 'observePage') {
       redundantReads++;
       correction =
-        '你不需要调用 extractPage 读取页面——每一步我都会把最新页面内容提供给你。请直接基于"当前页面/可交互元素"选择一个能推进目标的具体动作（点击某个链接、navigate、delegate 子任务，或在信息已足够时 done 并给出 summary）。';
+        '你不需要调用 extractPage——每一步我都会把最新页面快照提供给你。若目标是阅读/分析页面内容（如审查 diff、总结日志、抽取数据），而快照被截断看不全，请用 readText（可传 selector 只读某个区域，返回完整正文）或 getHTML 获取完整内容，而不是 extractPage；一旦已读到所需内容，请直接 done 并在 summary 中给出分析结论，不要反复重读同一处。否则请直接基于"当前页面/可交互元素"选择一个能推进目标的动作（点击链接、navigate、delegate 子任务）。';
       correctionTtl = 2;
       addLog(taskId, 'info', '🛠️ 已跳过冗余的页面读取，提示模型直接行动');
       emit(taskId);
@@ -971,7 +1283,7 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
     const sig = `${action.tool}:${JSON.stringify(action.args)}`;
     const sigSeen = (actionCounts.get(sig) ?? 0) + 1;
     actionCounts.set(sig, sigSeen);
-    const thoughtKey = (decision.thought || '').trim().toLowerCase();
+    const thoughtKey = (stepThought || '').trim().toLowerCase();
     let thoughtSeen = 0;
     if (thoughtKey) {
       thoughtSeen = (thoughtCounts.get(thoughtKey) ?? 0) + 1;
@@ -1003,7 +1315,7 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
       task = updateTask(taskId, {
         status: 'completed',
         outcome: 'gave_up',
-        result: (await finalizeResult(taskId)) + '\n\n⚠️ 多次尝试后仍无法继续推进，已停止。',
+        result: await finalizeWithReview(taskId, '⚠️ 多次尝试后仍无法继续推进，已停止。'),
         recordedSteps: recordWorkflowDraft(task),
       });
       addLog(taskId, 'warn', `检测到重复动作，已停止: ${sig.slice(0, 120)}`);
@@ -1011,8 +1323,38 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
       break;
     }
 
-    const confirmation = requiresConfirmation(action.tool, action.args, decision.thought);
-    if (confirmation.required) {
+    const confirmation = requiresConfirmation(action.tool, action.args, stepThought);
+    const confirmPolicy = task.confirmPolicy ?? 'ask';
+    if (confirmation.required && confirmPolicy === 'reject') {
+      // Default = auto-reject: deny without asking, record it as a failed action
+      // so the agent avoids re-proposing it, and steer toward a low-risk path.
+      addLog(taskId, 'warn', `已按默认设置自动拒绝高风险操作: ${action.tool}`);
+      task = updateTask(taskId, {
+        toolCalls: [
+          ...task.toolCalls,
+          {
+            id: uuidv4(),
+            taskId,
+            tool: action.tool,
+            args: action.args,
+            error: '高风险操作已按默认设置自动拒绝',
+            startedAt: Date.now(),
+            completedAt: Date.now(),
+            riskLevel: 'high',
+            confirmed: false,
+          },
+        ],
+      });
+      correction =
+        `该操作（${action.tool}）被判定为高风险，已按你的默认设置自动拒绝。请改用不修改数据/不提交的低风险方式达成目标，` +
+        `或跳过这一步；若整体目标必须执行该高风险操作，请用 needsInput 向用户说明并请求改设置。`;
+      correctionTtl = 2;
+      task = updateTask(taskId, { currentStepIndex: task.currentStepIndex + 1 });
+      persistGuards();
+      emit(taskId);
+      continue;
+    }
+    if (confirmation.required && confirmPolicy !== 'auto') {
       task = updateTask(taskId, {
         status: 'waiting_confirmation',
         pendingConfirmation: {
@@ -1032,9 +1374,12 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
 
     addLog(taskId, 'info', `执行: ${action.tool}`);
     emit(taskId);
+    // Snapshot BEFORE execution so a step whose expectation is only {changed:true}
+    // can be verified against the page diff.
+    const ctxBeforeExec = pageContext;
     const result = await executeStep(
       task,
-      makeSyntheticStep(action.tool, action.args, decision.thought || action.tool)
+      makeSyntheticStep(action.tool, action.args, stepThought || action.tool)
     );
 
     if (result.pageContext) {
@@ -1043,6 +1388,13 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
     }
 
     if (!result.success) {
+      // A failed step invalidates the rest of the optimistic batch (later steps
+      // assumed this one succeeded). Drop the queue so the next iteration
+      // re-decides against the real current page.
+      if (batchQueue.length) {
+        batchQueue = [];
+        persistBatch();
+      }
       // A "no-op" click (resolved but produced no page change) is a soft signal:
       // count it toward the cumulative/recurring-error budget (→ correction, then
       // ask the user) but NOT toward the abrupt consecutive-failure hard-fail, so a
@@ -1092,6 +1444,31 @@ export async function runAgentLoop(taskId: string): Promise<Task> {
       }
     } else {
       consecutiveFailures = 0;
+      // Optimistic verification: confirm the step actually did what the batch
+      // expected. A mismatch discards the rest of the batch and forces a fresh
+      // decision at this "stuck point" (with full history + current page). A
+      // failed expectation is NOT a task failure — it costs at most one extra
+      // decision, so an over-strict expectation can't abort the run.
+      if (planned.expect || planned.verify) {
+        const verdict = await verifyStep(task, planned, pageContext, ctxBeforeExec);
+        if (!verdict.ok) {
+          const dropped = batchQueue.length;
+          if (dropped) {
+            batchQueue = [];
+            persistBatch();
+          }
+          correction =
+            `上一步（${planned.tool}）执行后未达到预期${verdict.reason ? `（${verdict.reason}）` : ''}。` +
+            `请根据当前页面重新判断下一步，不要假设后续步骤仍然成立。`;
+          correctionTtl = 2;
+          addLog(
+            taskId,
+            'info',
+            `🔎 预期校验未通过，放弃剩余 ${dropped} 步并重新决策${verdict.reason ? `：${verdict.reason}` : ''}`.slice(0, 160)
+          );
+          emit(taskId);
+        }
+      }
     }
 
     task = updateTask(taskId, { currentStepIndex: task.currentStepIndex + 1 });
@@ -1385,7 +1762,7 @@ async function runSubAgent(
       args: compactArgs(action.args),
       success: result.success,
       error: result.error,
-      result: result.success ? summarizeToolResult(action.tool, result.result) : undefined,
+      result: result.success ? summarizeToolResult(action.tool, result.result, true) : undefined,
     });
     if (!result.success) {
       consecutiveFailures++;
@@ -1458,6 +1835,28 @@ async function finalizeResult(taskId: string, summary?: string): Promise<string>
   return summary ?? summarizeResult(t);
 }
 
+/**
+ * Build a give-up result that has been self-reviewed. If the assembled text does
+ * not actually answer the goal AND nothing task-relevant was collected, we return
+ * an honest "found nothing" line instead of dumping page chrome/footer as a fake
+ * "partial result". Site-agnostic.
+ */
+async function finalizeWithReview(taskId: string, note: string): Promise<string> {
+  const t = getTask(taskId);
+  const base = await finalizeResult(taskId);
+  const collected = (t?.collected ?? []).length;
+  try {
+    const rv = await reviewResult(t?.userRequest ?? '', base);
+    if (!rv.ok && collected === 0) {
+      addLog(taskId, 'warn', `🔍 结果审查未通过：${rv.reason ?? '结果与目标无关'}`);
+      return `未能获取到与目标相关的有效结果${rv.reason ? `（${rv.reason}）` : ''}。\n\n${note}`;
+    }
+  } catch {
+    /* reviewer failed → fall through to the assembled result */
+  }
+  return `${base}\n\n${note}`;
+}
+
 function summarizeResult(task: Task): string {
   const okCalls = task.toolCalls.filter((c) => !c.error);
   const usedTools = Array.from(new Set(okCalls.map((c) => c.tool)));
@@ -1476,7 +1875,11 @@ function summarizeResult(task: Task): string {
   return parts.join('\n');
 }
 
-export async function confirmPendingAction(taskId: string, confirmed: boolean): Promise<Task> {
+export async function confirmPendingAction(
+  taskId: string,
+  confirmed: boolean,
+  dontAskAgain = false
+): Promise<Task> {
   let task = getTask(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
   if (task.status !== 'waiting_confirmation') {
@@ -1484,6 +1887,13 @@ export async function confirmPendingAction(taskId: string, confirmed: boolean): 
   }
 
   const pending = task.pendingConfirmation;
+
+  // "Confirm & don't ask again": stop gating high-risk actions for the rest of
+  // THIS task. Persist it up-front so the resumed loop below sees the flag.
+  if (confirmed && dontAskAgain) {
+    task = updateTask(taskId, { confirmPolicy: 'auto' });
+    addLog(taskId, 'info', '已开启本任务「不再询问」，后续高风险操作将自动执行');
+  }
 
   if (!confirmed) {
     recordAudit({

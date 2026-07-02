@@ -16,6 +16,13 @@ export type TaskStatus =
  */
 export type RequestMode = 'auto' | 'ask' | 'agent' | 'plan';
 
+/**
+ * Default handling for high-risk actions: pause and ask each time, auto-run
+ * them, or auto-reject them. Chosen by the user in the composer and carried on
+ * each task; site-agnostic (independent of which tool/site is involved).
+ */
+export type ConfirmPolicy = 'ask' | 'auto' | 'reject';
+
 /** How a request was routed once classified. */
 export type TaskIntent = 'chat' | 'agent' | 'clarify';
 
@@ -42,6 +49,43 @@ export interface TaskPlan {
   risks?: string[];
 }
 
+/**
+ * A deterministic post-condition for a single action, verified locally with
+ * ZERO LLM calls. Mirrors the `expect` browser tool's arguments so the same
+ * check can run in the page. Site-agnostic by construction.
+ */
+export interface StepExpectation {
+  /** An element that should be present after the step. */
+  selector?: string;
+  /** Whether `selector` should be visible (default) or gone. */
+  state?: 'visible' | 'gone';
+  /** Substring the page text should contain. */
+  text?: string;
+  /** Substring the URL should contain. */
+  urlIncludes?: string;
+  /** Attribute (on `selector`) whose value should equal `equals`. */
+  attribute?: string;
+  equals?: string;
+  /** Weakest check: just require the page to have changed vs. before the step. */
+  changed?: boolean;
+}
+
+/**
+ * One action emitted by the batched decision LLM. The agent executes a run of
+ * these consecutively, verifying each with `expect` (deterministic, no LLM) or,
+ * only when no deterministic check is possible, a light `verify` LLM check.
+ */
+export interface PlannedStep {
+  tool: string;
+  args: Record<string, unknown>;
+  /** Deterministic post-condition; verified locally with zero LLM. */
+  expect?: StepExpectation;
+  /** Natural-language check used ONLY when `expect` is absent (hybrid: 1 light LLM call). */
+  verify?: string;
+  /** Short rationale, surfaced in the task logs. */
+  thought?: string;
+}
+
 export interface InteractiveElement {
   id: string;
   tag: string;
@@ -62,6 +106,24 @@ export interface InteractiveElement {
   disabled?: boolean;
   /** aria-expanded state for disclosure controls (panels, menus, comboboxes). */
   expanded?: boolean;
+  /** Checkbox/radio checked state, or aria-checked for custom widgets. */
+  checked?: boolean;
+  /** aria-selected state (tabs, options, grid cells). */
+  selected?: boolean;
+  /** Current value of an input/textarea/select (truncated; omitted for passwords). */
+  value?: string;
+  /** The control is required (native required or aria-required). */
+  required?: boolean;
+  /** The control is read-only (native readOnly or aria-readonly). */
+  readOnly?: boolean;
+  /** True when this is a file-picker input (<input type=file>). */
+  isFileInput?: boolean;
+  /** The file input's accept attribute (allowed types), when present. */
+  accepts?: string;
+  /** aria-haspopup value: menu/listbox/dialog/tree/grid — reveals a popup on activate. */
+  hasPopup?: string;
+  /** aria-current value (page/step/true) marking the active item in a set. */
+  current?: string;
 }
 
 /**
@@ -96,6 +158,18 @@ export interface PageContext {
   headings?: Array<{ level: number; text: string }>;
   /** Id of the region that is the currently focused modal/dialog, if any. */
   activeDialogRegionId?: string;
+  /** Latest text from aria-live / role=alert|status regions (dynamic feedback). */
+  announcements?: string[];
+  /** Iframes on the page and whether their content is reachable (same-origin). */
+  iframes?: Array<{ selector: string; sameOrigin: boolean; title?: string }>;
+  /** Inner scroll containers (virtualized lists, log panels) worth scrolling. */
+  scrollables?: Array<{ selector: string; label?: string; canScrollDown: boolean }>;
+  /**
+   * A concise, server-computed summary of what changed since the previous step
+   * (new/removed blocks, appeared dialog/toast, URL change). Not filled by the
+   * extractor — the orchestrator sets it before each decision.
+   */
+  changeSummary?: string;
   timestamp: number;
 }
 
@@ -299,6 +373,12 @@ export interface Task {
   checkpoint?: TaskCheckpoint;
   /** Persisted anti-flail counters (see AgentGuardState) — survive pause/resume. */
   guardState?: AgentGuardState;
+  /**
+   * Remaining actions from the last batched decision, executed optimistically
+   * without re-invoking the LLM. Persisted so the queue survives pause/resume
+   * (e.g. a high-risk confirmation re-enters the agent loop).
+   */
+  pendingBatch?: PlannedStep[];
   toolCalls: ToolCallRecord[];
   logs: TaskLogEntry[];
   /** Durable results gathered during a map-reduce style run (deduped by key). */
@@ -314,6 +394,13 @@ export interface Task {
     args: Record<string, unknown>;
     reason: string;
   };
+  /**
+   * How high-risk actions are handled in THIS task: 'ask' pauses for the user
+   * each time (default), 'auto' runs them without asking, 'reject' auto-denies
+   * them without asking. Seeded from the composer's default and can be switched
+   * to 'auto' by the "confirm & don't ask again" button.
+   */
+  confirmPolicy?: ConfirmPolicy;
   createdAt: number;
   updatedAt: number;
 }

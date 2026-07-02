@@ -1167,6 +1167,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             pageContext,
             attachments: message.attachments,
             kind: message.kind ?? 'once',
+            confirmPolicy: message.confirmPolicy,
             loopIntervalMs: message.loopIntervalMs,
             loopMaxIterations: message.loopMaxIterations,
           }),
@@ -1184,7 +1185,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       case 'CONFIRM_TASK':
         return apiRequest(`/api/tasks/${message.taskId}/confirm`, {
           method: 'POST',
-          body: JSON.stringify({ confirmed: message.confirmed }),
+          body: JSON.stringify({ confirmed: message.confirmed, dontAskAgain: message.dontAskAgain }),
         });
       case 'STEER_TASK':
         return apiRequest(`/api/tasks/${message.taskId}/steer`, {

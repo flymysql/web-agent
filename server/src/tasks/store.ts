@@ -6,6 +6,7 @@ import type {
   PageContext,
   RequestMode,
   TaskAttachment,
+  ConfirmPolicy,
 } from '@ai-browser-agent/shared';
 import { JsonRepository } from '../persistence/json-repository.js';
 import { debugLog } from '../debug/logger.js';
@@ -36,6 +37,7 @@ export function createTask(input: {
   loopMaxIterations?: number;
   workflowId?: string;
   attachments?: TaskAttachment[];
+  confirmPolicy?: ConfirmPolicy;
 }): Task {
   const now = Date.now();
   const task: Task = {
@@ -46,6 +48,7 @@ export function createTask(input: {
     kind: input.kind ?? 'once',
     mode: input.mode ?? 'agent',
     requestMode: input.requestMode ?? 'auto',
+    confirmPolicy: input.confirmPolicy ?? 'ask',
     maxSteps: input.maxSteps,
     workflowId: input.workflowId,
     tabId: input.tabId,

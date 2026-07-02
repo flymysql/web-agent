@@ -47,6 +47,15 @@ function describeElement(el: InteractiveElement, withSelector: boolean): string 
   if (el.disabled) state.push('disabled');
   if (el.expanded === true) state.push('expanded');
   if (el.expanded === false) state.push('collapsed');
+  if (el.checked === true) state.push('checked');
+  if (el.checked === false) state.push('unchecked');
+  if (el.selected === true) state.push('selected');
+  if (el.current) state.push('current');
+  if (el.required) state.push('required');
+  if (el.readOnly) state.push('readonly');
+  if (el.value) state.push(`value="${el.value.slice(0, 40)}"`);
+  if (el.hasPopup) state.push(`haspopup=${el.hasPopup}`);
+  if (el.isFileInput) state.push(`upload${el.accepts ? `:accept=${el.accepts}` : ''}`);
   const stateStr = state.length ? ` (${state.join(',')})` : '';
   const label = name || '(no label)';
   return withSelector
@@ -79,6 +88,47 @@ export function summarizePageContext(
       '',
       `⚠️ 当前聚焦：置顶弹窗/对话框「${activeDialog.label ?? activeDialog.role}」——优先在此弹窗内操作，除非需要先关闭它。`
     );
+  }
+
+  // Live-region feedback (validation errors, toasts, "no results", "saved") — the
+  // page's own reaction to the last action, which a flat element list would miss.
+  if (ctx.announcements?.length) {
+    lines.push('', '页面提示/状态 (live regions — 页面对上一步的反馈):');
+    ctx.announcements.slice(0, 6).forEach((a) => lines.push(`- ${a}`));
+  }
+
+  // Affordances the agent otherwise can't tell apart from decoration: upload
+  // controls (use uploadFile, never click), iframes, and inner scroll areas.
+  const uploads = ctx.interactiveElements.filter((el) => el.isFileInput);
+  if (uploads.length) {
+    lines.push(
+      '',
+      '文件上传控件（用 uploadFile 直接设置文件，不要 click——点击会弹出无法操控的系统文件框）:'
+    );
+    uploads
+      .slice(0, 8)
+      .forEach((u) =>
+        lines.push(`  ${u.selector} → 上传${u.accepts ? `（accept=${u.accepts}）` : ''}`)
+      );
+  }
+  if (ctx.iframes?.length) {
+    lines.push('', 'Iframes:');
+    ctx.iframes
+      .slice(0, 6)
+      .forEach((f) =>
+        lines.push(
+          `  ${f.selector}${f.title ? ` 「${f.title}」` : ''} — ${f.sameOrigin ? '同源，内容已并入上面的元素列表' : '跨域，内部内容无法读取/操作'}`
+        )
+      );
+  }
+  if (ctx.scrollables?.length) {
+    const scrollable = ctx.scrollables.filter((s) => s.canScrollDown);
+    if (scrollable.length) {
+      lines.push('', '可滚动区域（内容可能被裁剪，需滚动/readText 才能看全）:');
+      scrollable
+        .slice(0, 5)
+        .forEach((s) => lines.push(`  ${s.selector}${s.label ? ` 「${s.label}」` : ''}`));
+    }
   }
 
   if (ctx.headings?.length) {

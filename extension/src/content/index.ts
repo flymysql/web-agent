@@ -1,5 +1,5 @@
 import { extractPageContext } from './page-context.js';
-import { executeBrowserTool } from './browser-tools.js';
+import { executeBrowserTool, settleDom, MUTATING_TOOLS } from './browser-tools.js';
 import { initFloatingUI } from './floating-ui.js';
 import { startRecording, stopRecording } from './recorder.js';
 
@@ -37,6 +37,12 @@ if (!window.__AI_AGENT_CONTENT__) {
             return { success: false, error: 'tool name required' };
           }
           const result = await executeBrowserTool(message.tool, message.args ?? {});
+          // Let async/lazy DOM updates from a mutating action land before we
+          // snapshot, so the agent sees the settled page (new fields, revealed
+          // panels, enabled buttons) rather than the pre-mutation state.
+          if (result.success && MUTATING_TOOLS.has(message.tool)) {
+            await settleDom();
+          }
           const pageContext = extractPageContext();
           return { ...result, pageContext };
         }

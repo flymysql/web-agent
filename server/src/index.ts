@@ -100,6 +100,7 @@ app.post('/api/tasks', async (req, res) => {
       attachments,
       kind,
       requestMode,
+      confirmPolicy,
       loopIntervalMs,
       loopMaxIterations,
     } = req.body as {
@@ -111,6 +112,7 @@ app.post('/api/tasks', async (req, res) => {
       attachments?: TaskAttachment[];
       kind?: 'once' | 'loop';
       requestMode?: RequestMode;
+      confirmPolicy?: import('@ai-browser-agent/shared').ConfirmPolicy;
       loopIntervalMs?: number;
       loopMaxIterations?: number;
     };
@@ -127,6 +129,7 @@ app.post('/api/tasks', async (req, res) => {
       attachments,
       kind,
       requestMode,
+      confirmPolicy,
       loopIntervalMs,
       loopMaxIterations,
     });
@@ -256,8 +259,8 @@ app.post('/api/tasks/:id/steer', (req, res) => {
 
 app.post('/api/tasks/:id/confirm', async (req, res) => {
   try {
-    const { confirmed } = req.body as { confirmed: boolean };
-    const task = await confirmPendingAction(req.params.id, confirmed ?? false);
+    const { confirmed, dontAskAgain } = req.body as { confirmed: boolean; dontAskAgain?: boolean };
+    const task = await confirmPendingAction(req.params.id, confirmed ?? false, dontAskAgain ?? false);
     broadcastTaskUpdate(task.id);
     res.json({ task });
   } catch (err) {

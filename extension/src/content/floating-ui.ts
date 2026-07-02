@@ -539,6 +539,8 @@ textarea.set-in { resize: vertical; min-height: 58px; font-family: inherit; }
 .btn-ok:hover { background: #248a3d; }
 .btn-no, .btn-cancel { background: var(--fill); color: var(--blue); }
 .btn-no:hover, .btn-cancel:hover { background: var(--fill-2); }
+.btn-always { background: var(--fill); color: var(--green); box-shadow: inset 0 0 0 1px var(--green); }
+.btn-always:hover { background: var(--fill-2); }
 
 .thinking-dots span {
   display: inline-block; width: 6px; height: 6px; margin: 0 1px; border-radius: 50%;
@@ -598,11 +600,11 @@ textarea.set-in { resize: vertical; min-height: 58px; font-family: inherit; }
   user-select: none; -webkit-user-select: none; touch-action: none;
 }
 .rec-bar .rec-guide.talking { background: #ef4444; color: #fff; border-color: #ef4444; }
-.toolbar .mode-select {
+.toolbar .mode-select, .toolbar .risk-select {
   font-size: 12px; padding: 5px 9px; border: 0.5px solid var(--separator); border-radius: 999px;
   background: var(--bg-elev); color: var(--label); cursor: pointer; font-family: inherit;
 }
-.toolbar .mode-select:focus { outline: none; border-color: var(--blue); }
+.toolbar .mode-select:focus, .toolbar .risk-select:focus { outline: none; border-color: var(--blue); }
 .toolbar .send {
   width: 32px; height: 32px; border-radius: 50%; border: none; background: var(--blue); color: #fff;
   cursor: pointer; font-size: 16px; flex-shrink: 0; transition: background 0.15s, transform 0.12s;
@@ -684,6 +686,7 @@ export class AgentWidget {
   private statusDot!: HTMLDivElement;
   private badge!: HTMLDivElement;
   private modeSelect!: HTMLSelectElement;
+  private riskSelect!: HTMLSelectElement;
   private attachBtn!: HTMLButtonElement;
   private micBtn!: HTMLButtonElement;
   private fileInput!: HTMLInputElement;
@@ -987,6 +990,11 @@ export class AgentWidget {
               <option value="agent">🤖 执行</option>
               <option value="plan">📋 仅计划</option>
             </select>
+            <select class="risk-select" title="高风险操作（提交/删除/支付等）的默认处理方式">
+              <option value="ask">🛡 高危：每次询问</option>
+              <option value="auto">⚡ 高危：自动执行</option>
+              <option value="reject">🚫 高危：自动拒绝</option>
+            </select>
             <span class="spacer"></span>
             <button class="send" title="发送">↑</button>
           </div>
@@ -1010,6 +1018,7 @@ export class AgentWidget {
     this.sendBtn = panel.querySelector('.send') as HTMLButtonElement;
     this.statusDot = panel.querySelector('.status-dot') as HTMLDivElement;
     this.modeSelect = panel.querySelector('.mode-select') as HTMLSelectElement;
+    this.riskSelect = panel.querySelector('.risk-select') as HTMLSelectElement;
     this.attachBtn = panel.querySelector('.attach-btn') as HTMLButtonElement;
     this.micBtn = panel.querySelector('.mic-btn') as HTMLButtonElement;
     this.fileInput = panel.querySelector('.file-input') as HTMLInputElement;
@@ -1140,6 +1149,7 @@ export class AgentWidget {
 
     this.sendBtn.addEventListener('click', () => this.handleSend());
     this.stopBtn.addEventListener('click', () => this.stopCurrentTask());
+    this.bindRiskDefault();
     this.input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
@@ -2141,6 +2151,7 @@ export class AgentWidget {
         userRequest: text,
         sessionId: this.currentSessionId ?? undefined,
         requestMode,
+        confirmPolicy: this.riskSelect?.value || 'ask',
         kind: 'once',
         attachments: attachments.length ? attachments : undefined,
       });
@@ -3696,6 +3707,37 @@ export class AgentWidget {
     });
   }
 
+  /**
+   * The composer's high-risk default: persist the user's choice and seed every
+   * new task with it. Stored in chrome.storage.local so it survives reloads and
+   * applies across pages/tabs.
+   */
+  private bindRiskDefault(): void {
+    const KEY = 'highRiskDefault';
+    try {
+      chrome.storage?.local.get(KEY, (data) => {
+        const v = data?.[KEY];
+        if (v === 'ask' || v === 'auto' || v === 'reject') this.riskSelect.value = v;
+      });
+    } catch {
+      /* storage unavailable — fall back to the default 'ask' */
+    }
+    this.riskSelect.addEventListener('change', () => {
+      try {
+        chrome.storage?.local.set({ [KEY]: this.riskSelect.value });
+      } catch {
+        /* ignore */
+      }
+      const label =
+        this.riskSelect.value === 'auto'
+          ? '高风险操作将自动执行（不再逐个询问）'
+          : this.riskSelect.value === 'reject'
+            ? '高风险操作将自动拒绝'
+            : '高风险操作将每次询问你确认';
+      this.addSystemMessage(`已设置默认：${label}`);
+    });
+  }
+
   private renderConfirmation(task: Task): void {
     const pc = task.pendingConfirmation!;
     const el = document.createElement('div');
@@ -3707,6 +3749,7 @@ export class AgentWidget {
         <div style="color:#6b7280;font-size:12px;">${this.escape(pc.reason)}</div>
         <div class="inline-actions">
           <button class="btn-ok">确认执行</button>
+          <button class="btn-always" title="本任务后续的高风险操作都自动执行，不再逐个询问">确认，且不再询问</button>
           <button class="btn-no">拒绝</button>
         </div>
       </div>`;
@@ -3714,17 +3757,22 @@ export class AgentWidget {
     this.scrollToBottom();
 
     const okBtn = el.querySelector('.btn-ok') as HTMLButtonElement;
+    const alwaysBtn = el.querySelector('.btn-always') as HTMLButtonElement;
     const noBtn = el.querySelector('.btn-no') as HTMLButtonElement;
-    const finish = (confirmed: boolean) => async () => {
+    const finish = (confirmed: boolean, dontAskAgain = false) => async () => {
       okBtn.disabled = true;
+      alwaysBtn.disabled = true;
       noBtn.disabled = true;
       el.querySelector('.inline-actions')?.remove();
-      await sendMessage({ type: 'CONFIRM_TASK', taskId: task.id, confirmed });
-      this.addSystemMessage(confirmed ? '已确认，继续执行' : '已拒绝该操作');
+      await sendMessage({ type: 'CONFIRM_TASK', taskId: task.id, confirmed, dontAskAgain });
+      this.addSystemMessage(
+        !confirmed ? '已拒绝该操作' : dontAskAgain ? '已确认，本任务后续不再询问' : '已确认，继续执行'
+      );
       this.startPolling();
       await this.refresh();
     };
     okBtn.addEventListener('click', finish(true));
+    alwaysBtn.addEventListener('click', finish(true, true));
     noBtn.addEventListener('click', finish(false));
   }
 
